@@ -1,0 +1,16 @@
+{
+  "name": "ai-chat-local",
+  "version": "1.7.1",
+  "description": "Local AI Character Chat - connects to Google Colab & Kaggle LLM Servers",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "beta-kaggle": "node server.js --beta-kaggle"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "uuid": "^10.0.0"
+  }
+}

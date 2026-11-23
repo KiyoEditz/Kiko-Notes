@@ -1,0 +1,479 @@
+# Changelog
+
+All notable changes to this project are documented here. Format loosely
+follows [Keep a Changelog](https://keepachangelog.com/).
+
+## [v1.7.1] — Per-Character Chat Storage Restructuring, `{{user}}` Macro Replacement & Canceled Temporal Awareness
+
+Infrastructure and storage performance release introducing **Per-Character Private Chat Directory Reorganization (`data/chats/private/<characterId>/<chatId>.json`)** and **Automatic `{{user}}` Persona Macro Replacement**. The experimental Temporal Awareness system was tested, evaluated, and subsequently canceled/archived.
+
+### Added
+- **Automatic `{{user}}` Persona Macro Replacement (`server.js`)**:
+  - Added `getPersonaName(personaId)` and `replaceUserMacro(text, userName)` to dynamically replace all `{{user}}` placeholders (case-insensitive, e.g. `{{user}}`, `{{User}}`, `{{USER}}`) with the active user persona's name across system prompts, character definitions, opening greetings, and message histories right before sending payloads to the LLM (for Private Chat, Regenerate, and Group Chat).
+
+### Canceled / Experimental (Archived to Branch `TemporalAwareness`)
+- **Real-World Temporal & Clock Awareness Engine (`server.js`)**:
+  - *Status:* **Canceled and preserved on branch `TemporalAwareness`** for future research and larger frontier models.
+  - *Rationale:* Real-world evaluation with local fine-tuned open-weight models (e.g., Gemma/Llama roleplay fine-tunes) revealed that system-level temporal anchors (`Current Date` and elapsed absence time) suffer from instruction over-indexing—causing the model to unpromptedly recite dates upon opening conversations (e.g. *"Sekarang hari Kamis, tanggal 12 November..."*)—and tokenizer year hallucinations (e.g. interpreting `2026` as `2066` or `20.26`), which broke character immersion.
+  - *Branch Access:* The full working implementation (including 2-tier cache-friendly architecture, 1-shot absence gap detection, group chat parity, and settings toggle) remains fully functional and accessible on git branch `TemporalAwareness` (`git checkout TemporalAwareness`).
+
+### Changed & Improved
+- **Per-Character Private Chat Directory Reorganization (`data/chats/private/<characterId>/<chatId>.json`)**:
+  - **Scoped Directory Structure**: Migrated all private chat session files from the root `data/chats/private/` directory into dedicated character subdirectories (`data/chats/private/<characterId>/<chatId>.json`).
+  - **High-Performance Scoped File Resolution**:
+    - Implemented `safePrivateChatPath(characterId, chatId)` and `findPrivateChatPath(chatId, characterId)`.
+    - Endpoint `GET /api/chats/:characterId` now reads only the target character's subfolder rather than filtering hundreds of global chat files, significantly reducing filesystem I/O.
+    - Endpoints `POST /api/chats`, `GET /api/chat/:chatId`, `PUT /api/chat/:chatId`, and `DELETE /api/chat/:chatId` fully support scoped subfolder storage.
+    - Character deletion (`DELETE /api/characters/:id`) cleanly removes the character's entire chat folder in one operation.
+
+---
+
+## [v1.7.0] — Beta Kaggle Auto-Tunnel Orchestrator, Responsive Editorial UI & CUDA 12.8/13.0 (`llama.cpp` `b12076`)
+
+Major feature and infrastructure release introducing **1-command automated Kaggle GPU orchestration (`npm run beta-kaggle`)**, a complete **Responsive Digital Typography & Warm Editorial UI Redesign**, and an upgraded **Multi-Arch CUDA Prebuilt & Source Build Engine (`llama.cpp` `b12076` / `v0.8.0`)** compatible with Kaggle's newest NVIDIA Driver `580.178.04` (CUDA 13.0 host / CUDA 12.8.93 toolkit).
+
+### Added
+- **Beta Kaggle Auto-Tunnel Orchestrator (`npm run beta-kaggle` / `kaggle-kernel/`)**:
+  - **Headless 1-Command Kaggle GPU Launch (`kaggle-kernel/orchestrator.js` & `server.js --beta-kaggle`)**:
+    - Added `"beta-kaggle": "node server.js --beta-kaggle"` in `package.json`.
+    - Automatically stages and pushes the LLM server kernel (`aichat-kaggle-server`) to Kaggle with Dual Tesla T4 GPUs (`enable_gpu: true`, `enable_internet: true`) without opening a browser or manually copying Cloudflare URLs.
+    - Full mobile/single-device support: run `npm run beta-kaggle` directly on a single device (including Termux/mobile or low-spec laptop) and AIChat automatically binds the remote Kaggle GPU endpoint into `runtimeConfig.baseUrl` & `runtimeConfig.apiKey`.
+  - **Non-Stop Dual-Channel URL Handshake (`kaggle-kernel/kernel/main.py` & `orchestrator.js`)**:
+    - Once `llama-server` and `cloudflared` pass a real 1-token completion sanity test, the kernel commits `tunnel.json` (tagged with a unique `runId`) to a private Kaggle Dataset (`<username>/aichat-kaggle-tunnel`) **from inside the running script** without stopping the kernel.
+    - Local orchestrator polls both the private dataset (`tunnel.json` with `runId` verification to reject stale URLs) and live kernel logs (`===AICHAT_TUNNEL_START===...===AICHAT_TUNNEL_END===`) as a fallback.
+  - **Internal Python Reverse Proxy Gateway & Dual-Layer Remote Shutdown (`kaggle-kernel/kernel/main.py`)**:
+    - Lightweight internal HTTP/TCP gateway (`GATEWAY_PORT = 8080` -> `LLAMA_INTERNAL_PORT = 8081`) exposed through the single Cloudflare Tunnel URL:
+      - `GET /__aichat_ping`: Heartbeat endpoint pinged every 60 seconds by the local AIChat server.
+      - `POST /__aichat_shutdown`: Instant remote shutdown endpoint triggered automatically when the local AIChat server receives `SIGINT` (`Ctrl+C`) or `SIGTERM`, terminating `llama-server` and `cloudflared` and exiting the Kaggle kernel immediately to save weekly GPU quota.
+      - **30-Minute Auto-Idle Watchdog (`IDLE_TIMEOUT_SECONDS = 1800`)**: Automatically shuts down the Kaggle kernel if no heartbeat or chat activity occurs for 30 minutes (e.g., if the local device loses power or internet), while pausing the idle timer whenever an LLM streaming generation is actively in-flight.
+  - **Credential Setup & Documentation (`kaggle-kernel/config/`)**:
+    - Added `kaggle-kernel/config/kaggle.json.example` and `kaggle-kernel/config/README.md` with step-by-step instructions for both legacy `kaggle.json` API tokens and new `KGAT_...` API tokens, protected by `.gitignore`.
+
+### Changed & Improved
+- **Responsive Digital Typography & Warm Editorial UI Redesign (`public/styles.css`, `public/settings.css`, `public/donate.css`, `public/*.html`)**:
+  - **Glare-Free Warm Paper Light Mode & Obsidian Dark Mode**:
+    - Replaced stark `#FFFFFF` backgrounds and `#000000` text in Light Mode with soft warm paper (`#F8F6F1` canvas, `#F2EFE9` surface, `#EAE6DF` assistant bubble) and deep charcoal ink (`#222222`), eliminating eye strain during extended reading.
+    - Refined Dark Mode with warm obsidian surfaces (`#0D0E12`), slate assistant bubbles (`#1A1D26`), and warm indigo user bubbles (`#252849`).
+  - **Clear Dialogue vs. Action/Narration Visual Hierarchy**:
+    - Spoken `"dialogue"` renders in crisp sans-serif (`Plus Jakarta Sans` / `Inter`) with medium weight (`450`) and primary contrast.
+    - Character `*action / narration*` (`<em class="action-text">`) renders in editorial italic serif (`Georgia, 'Times New Roman', serif`) with a warm muted terracotta (`#6E5647` in Light Mode) or warm amber-stone (`#A89F91` in Dark Mode) tone so actions and dialogue are immediately distinguishable at a glance.
+  - **Strict Line-Length Measure & Breathing Spacing**:
+    - Constrained chat bubble width to `min(78%, 65ch)` (~60–75 characters per line / ~660px) with `1.62` line-height and `16px` (`1rem`) body font size to prevent reading fatigue.
+  - **Language Translation Protection (`translate="no"` / `.notranslate`)**:
+    - Preserved native 12-language UI i18n while protecting chat message bubbles and character names from automatic browser translation.
+- **`llama.cpp` `b12076` (`v0.8.0`) Upgrade & CUDA 12.8 / Driver 580+ Build Hardening**:
+  - Upgraded `LLAMA_CPP_TAG` from `b10605` to **`b12076`** (`v0.8.0`) across `Build-Llama-CUDA-Release.py`, `kaggle-kernel/kernel/main.py`, `Kaggle-Llama.py`, `Kaggle-Llama-Private.py`, `Collab-Llama.py`, `Collab-Llama-Private.py`, `Build-Molab-CUDA-Release.py`, and `Molab-Llama.py`.
+  - **CUDA Driver & Linker Hardening (`cuda_driver_cmake_flags()` & `build_from_source()`)**:
+    - Created dual symlinks (`libcuda.so` and `libcuda.so.1`) in `/tmp/cuda-driver-link` with `-Wl,-rpath-link,/tmp/cuda-driver-link -Wl,--allow-shlib-undefined` so both CMake's `CUDA::cuda_driver` target and GNU `ld`'s transitive `DT_NEEDED` resolution succeed on Kaggle's NVIDIA Driver `580.178.04` (CUDA 13.0 host / CUDA 12.8.93 toolkit).
+    - Passed CMake arguments as a Python list (`shell=False`) so semicolon-separated multi-arch strings (`75-real;80-real;86-real;89-real;90-real;90-virtual`) are never split by `/bin/sh`.
+    - Isolated multi-arch compilation inside `/kaggle/tmp` (`/tmp`) scratch storage to prevent exhausting `/kaggle/working`'s 19.5 GB quota, and documented the ~1 hour 30 minutes one-time build duration on Kaggle's 4-core CPU.
+    - Added `resolve_prebuilt_url()` to automatically discover `llama-cuda-multiarch-b12076.tar.gz` across GitHub Releases on `KiyoEditz/AIChat-With-Notebooks`.
+
+---
+
+## [v1.6.1] — Bug Fixes & Stability Hardening
+
+Comprehensive bug fix and stability release addressing concurrency race conditions, markdown rendering fidelity, group chat session preservation, and memory/persona synchronization.
+
+### Fixed & Improved
+- **Concurrency & Race Condition Hardening (`server.js` & `public/app.js`)**:
+  - **Message ID-Based Alternate Targeting**: Replaced brittle message index fallbacks in `/api/chat/regenerate` and `/api/group-chat/regenerate` with unique message ID resolution, preventing stale overwrites or array boundary errors if earlier messages are deleted while an LLM call is in-flight.
+  - **In-Flight Message Editing & Send Lockout**: Kept message Edit and Delete actions unlocked and fully interactive during in-flight LLM generations so users can correct typos or adjust dialogue immediately without waiting. Preserved message history integrity via UUID lookup and fresh disk re-reads upon LLM completion. Only new prompt submissions (`#btn-send`) and active speaker turns (`#btn-take-turn`) are locked while an LLM stream is active.
+
+- **Markdown & Action Text Rendering Engine (`public/app.js` & `public/styles.css`)**:
+  - **Code Block Pre-Protection**: Escaped code fences (```) and inline code (`) using placeholder tokens (`@@CODE_BLOCK_X@@`) prior to formatting, preventing code syntax from being altered by markdown passes.
+  - **Asterisk Parsing Isolation**: Replaced naive global regexes with negative lookahead/lookbehind patterns for bold-italic (`***`), bold (`**`, `__`), and italic/action (`*`). Preserves arithmetic expressions (e.g., `2 * 3 * 4`) without accidental italicization.
+  - **Distinct Action & Dialogue Styling**: Enclosed italic action text in `<em class="action-text">` with a refined semi-transparent muted tone, clearly demarcating character narration/actions from spoken dialog (`"dialog"`).
+
+- **Group Chat Data Integrity & Session Resolution (`server.js` & `public/app.js`)**:
+  - **Session-Aware Message Counting**: Updated `GET /api/groups` to calculate message counts dynamically from session files in `chats/groups/<groupId>/` instead of reading obsolete root JSON files.
+  - **Group Edit Data Protection**: Fixed `PUT /api/groups/:id` to preserve existing group conversation history when updating room metadata (name, scenario, members, or avatar).
+  - **Deterministic Session Ordering**: Refactored `resolveGroupSession` in `server.js` to sort session files by filesystem modification time (`mtime` / `updatedAt`) descending instead of alphabetical UUID sorting, ensuring the most recently active session is always picked when `chatId` is omitted.
+  - **Auto-Titling for Group Sessions**: Group chat sessions now automatically rename from "New Chat" / "New Session" to the first 60 characters of the initial user message upon first send, matching private chat functionality.
+  - **Special Character Regex Escaping in Prefix Stripping**: Escaped regex special characters in character names inside `callGroupCharacterLLM` (`server.js`), preventing syntax errors or broken name prefix stripping for characters with brackets or parentheses (e.g., `Sakura (Maid)` or `Zero [02]`).
+
+- **Memory System & Persona Synchronization (`server.js` & `public/app.js`)**:
+  - **Draft-Safe Persona Selection**: Decoupled persona chip selection in the Memory Modal into a draft state (`state.memoryModalDraftPersonaId`). Canceling or closing the modal discards changes, preventing avatar or prompt desynchronization until "💾 Simpan Memory" is explicitly clicked.
+  - **Speaker-Aware Group Memory Extraction & AI Summarization**: Prevented AI character utterances or automatic turn continuation prompts from being misattributed as user facts in `callGroupCharacterLLM`. Rewrote group AI summarization to structure transcripts with explicit `[Speaker]: Message` attribution.
+  - **Local Message Cache & Private Chat Avatar Re-rendering**: Fixed bug where switching personas in private chat failed to update chat bubble avatars because `state.chats` lacked message arrays. Added `state.currentMessages` tracking and updated `saveMemory()` to fetch fresh chat data and re-render user avatars immediately.
+
+## [v1.6.0] — Multi-Character Group Chat System & Architecture Overhaul
+
+Major release introducing the full Multi-Character Group Chat system with perspective-aware LLM roleplay, structured group memory, multi-session group history, mobile swipe gestures, and full 12-language synchronization.
+
+### Added
+- **Multi-Character Group Chat Engine (`server.js`)**:
+  - **Perspective-Aware Group Roleplay**: Characters maintain their unique personas, understand the shared group scenario, perceive which participant spoke each message (`[SpeakerName]: Message`), and respond in first-person without hallucinating other participants' turns.
+  - **Dynamic Turn System**: Added manual turn triggers (`POST /api/group-chat/turn`) allowing any character in the group to speak without requiring a new user prompt.
+  - **Intelligent @Mention Detection**: Automatically detects `@CharacterName` mentions in user prompts and routes the turn directly to the addressed character.
+  - **Group Session Management**: Multi-session group chats stored in isolated folders (`chats/groups/<groupId>/<chatId>.json`), supporting session creation, listing, renaming, and deletion.
+  - **Dual-Tier Memory Auto-Extraction**: Conversations update both the individual character's private memory and the shared group memory simultaneously.
+- **Group Chat UI & Management (`public/index.html` / `public/app.js` / `public/styles.css`)**:
+  - **Sidebar Navigation Tabs**: Added "Characters" and "Group Chats" tabs with active indicators, clean switching, and separate search filters.
+  - **Group Creation & Editor Modal**:
+    - Group room name, scenario/setting prompt, and active persona selector.
+    - Custom group avatar with file upload (auto-scaled to 256x256 WebP) and integrated Pinterest image search/picker (`groupPinterest`).
+    - Multi-character member selection cards with real-time member counters.
+  - **Header & Session Controls**:
+    - Compact member summary badge (`<N> Anggota` / `<N> Members`) in chat header.
+    - New Chat session button (`group.new_session`) and session history list with inline rename and delete controls.
+    - Shared Group Memory button in header opening the group fact, event, summary, and persona viewer.
+  - **Interactive Speaker Turn Bar**:
+    - Compact speaker selector bar positioned above chat input with character avatar chips (`.speaker-chip`).
+    - 1-click "⚡ Take Turn" button (`.btn-take-turn`) to advance the conversation smoothly.
+- **Group Chat Message Bubble Symmetry & Mobile Gestures**:
+  - **Full Parity with Single-Character Bubbles**: Identical structure featuring avatar, sender badge, bubble container, alternate navigation, timestamps, and edit/delete action triggers.
+  - **Mobile Left-Swipe Gesture**: Added `ontouchstart` and `ontouchend` handlers to `.message-bubble-container`, allowing mobile touch users to swipe the last AI message left to reveal the regenerate button (`🔄`).
+  - **Regenerate & Alternates (`/api/group-chat/regenerate`)**: Regenerate the last character's response with loading spinner animations and alternate pagination controls (`< 1/N >`).
+  - **Full-Width Message Editing**: Refactored `editGroupMessage` to expand into `.message-edit-container` with `.message-edit-textarea` (minimum 120px) and clean Cancel / Save buttons outside the bubble, eliminating duplicate previews and HTML quote escaping bugs.
+- **Full 12-Language i18n Synchronization (`public/Lang/`)**:
+  - Added 25 new translation keys for group chat tabs, creation forms, turn controls, session management, and toast notifications.
+  - Updated connection status indicator to "Connected to Backend" across all languages.
+  - Verified 100% key parity across all 12 supported languages (`AR`, `DE`, `EN`, `ES`, `FR`, `HI`, `ID`, `JP`, `KO`, `PT`, `RU`, `ZH`) with exactly 130 keys in every dictionary.
+
+### Changed & Improved
+- **Clean Folder Architecture (`memory/`)**:
+  - Reorganized memory directories into clean subfolders: `memory/private/` for 1-on-1 character memories and `memory/groups/` for shared group memories.
+- **Mobile Viewport & Keyboard UX**:
+  - Prevented intrusive forced keyboard popups when switching to group chats or receiving LLM stream responses, ensuring the mobile keyboard only appears when explicitly tapping the text input.
+- **Turn Bar Layout Polish**:
+  - Streamlined the turn bar into clean stacked pill blocks with optimized padding (`padding: 4px 10px;`) and removed redundant text prefixes for maximized mobile usability.
+
+---
+
+## [v1.5.5]
+
+### Added
+- **Custom Persona Avatar System**:
+  - Added custom avatar support for user personas across settings, active chat messages, and memory selectors.
+  - **Persona Avatar Management (`settings.html` / `settings.js`)**:
+    - Added dedicated avatar upload container with preview circle and remove button in `#persona-editor-card`.
+    - Integrated automatic client-side canvas image resizing to 256x256 WebP data URLs.
+    - Integrated Pinterest image search and picker directly within the persona editor (`/api/pinterest/search` & `/api/pinterest/image`).
+    - Added avatar preview thumbnails on persona cards in the Settings persona list.
+  - **Dynamic Chat Message Avatars (`public/app.js` / `public/styles.css`)**:
+    - Upgraded user message bubbles (`.message.user .message-avatar`) to dynamically render the active persona's avatar image instead of the static `👤` emoji.
+    - Preserved seamless fallback to `👤` whenever a persona has no avatar assigned.
+  - **Memory Selector Integration (`public/app.js` / `public/styles.css`)**:
+    - Added avatar preview icons inside persona selector chips (`.persona-chip-avatar`) and in the active persona summary card (`.persona-active-avatar`) within the chat memory modal.
+    - Selecting a new persona chip immediately updates user avatars in all rendered chat messages reactively.
+  - **Backend API & Schema (`server.js`)**:
+    - Added `avatar` field handling to `getPersonas()`, `POST /api/personas`, and `PUT /api/personas/:id`.
+- **Chat Message Deletion Endpoint & UI**:
+  - Added REST endpoint `DELETE /api/chat/:chatId/message/:index` in `server.js` with index boundary validation and atomic JSON disk persistence.
+  - Added message deletion button (`🗑️`) beside the edit button (`✏️`) in message metadata (`.message-meta`) with confirmation prompts and localized toast alerts.
+- **Full 12-Language i18n Synchronization (`public/Lang/`)**:
+  - Fully translated and synchronized all 12 supported languages (`AR`, `DE`, `EN`, `ES`, `FR`, `HI`, `ID`, `JP`, `KO`, `PT`, `RU`, `ZH`).
+  - Added localized translation keys across all languages for welcome actions, message editing, message deletion, and async waiting:
+    - `welcome.btn_donate`
+    - `chat.action.regenerate`
+    - `chat.action.delete`
+    - `chat.action.edit`
+    - `chat.confirm_delete_msg`
+    - `chat.msg_deleted`
+    - `btn.edit`
+    - `toast.please_wait`
+  - Normalized all 12 language dictionaries to 105 identical keys with zero missing entries.
+- **`Molab-Llama.py` (Beta / Staging)**:
+  - One-click LLM server script tailored for **Molab** (`molab.marimo.io`), featuring the **NVIDIA RTX PRO 6000 Blackwell Server Edition** (96 GB VRAM) GPU with CUDA 13.3.
+  - Marimo-native pure Python syntax avoiding syntax errors caused by IPython magics like `!cmd`.
+  - Automatic GPU compute capability detection (`sm_120` / `sm_100`).
+  - Robust CUDA toolkit environment resolution (`setup_cuda_toolkit_env()`) resolving `CUDAToolkit_ROOT`, `CUDA_CUDART_LIBRARY`, and driver symlinks so CMake natively discovers CUDA 13.3 runtime without missing `libcudart.so`.
+  - Massive context window default (`NUM_CTX = 16384`) leveraging 96 GB VRAM, with options for 32k/64k.
+  - Multi-tier model configurations optimized for 96GB VRAM (32B Q6_K default, 70B/72B flagship options).
+  - Built-in Hugging Face token resolution (`HF_TOKEN`) from environment variables, Molab Secrets tab, and `/marimo/.env`.
+- **`Build-Molab-CUDA-Release.py` (Dedicated Molab Builder)**:
+  - Standalone CUDA release packager specifically for building and packaging native Blackwell `sm_120` llama-server binary tarballs inside Molab.
+  - Automatically exports release packages to `/marimo/` ready for upload to GitHub Releases.
+
+### Changed & Improved
+- **Persona UI Streamlining & Bug Fixes**:
+  - Removed redundant `Persona #` badge from the persona editor card in Settings and from the active persona summary card in the chat memory modal for a cleaner, minimal appearance.
+  - Resolved cramped layout between the `+ Tambah` extra attribute button and `💾 Simpan Persona` by adding dedicated vertical spacing and an elegant divider border.
+- **Mobile Welcome Viewport & Responsive Layout (`#view-welcome`)**:
+  - Scaled mobile diamond icon (`✦`) up from `2.6rem` to `3rem` for well-balanced visual hierarchy on mobile screens.
+  - Resolved content cut-off and cramped layout on mobile screens by enabling native vertical scrolling (`overflow-y: auto`, `-webkit-overflow-scrolling: touch`) and safe centering (`min-height: 100%; height: auto; margin: auto 0; box-sizing: border-box;`).
+  - Optimized mobile icon and title spacing and aligned "Buka Settings" and "Donasi Proyek" buttons side-by-side on mobile devices (`flex-direction: row; gap: 8px; height: 40px;`).
+- **Clean Regenerate Button UI**:
+  - Preserved standalone regenerate button (`🔄`) on assistant message bubbles and removed adjacent delete triggers to prevent accidental deletions during chat.
+
+---
+
+## [v1.5.0] — Centralized Persona System & Structured User Attributes
+
+Refactors the persona architecture from duplicating `userPreferences` inside every character's memory file into a centralized, reusable persona pool in `data/persona/`, with a dedicated Settings management panel and compact chat memory selector.
+
+### Added
+- **Centralized Persona Storage (`data/persona/`)**:
+  - Persona profiles are now stored independently (e.g. `1.json`) and shared globally across all characters.
+  - Characters only store a concise `personaId` reference in their memory file, eliminating duplicated persona data across memory files.
+- **Dedicated Persona Management Panel (`settings.html`)**:
+  - Added new **👤 Persona** tab positioned directly below **Configuration** and above **Appearance**.
+  - Provides intuitive persona cards with index badges (e.g. `Persona #1`, `Persona #2`).
+  - Supports adding, editing, and deleting multiple personas.
+  - Strict input validation:
+    - **Name**: String (supports letters and numbers).
+    - **Age (Umur)**: Strictly number-only.
+    - **Height (Tinggi Badan)**: Strictly number-only in cm.
+    - **Weight (Berat Badan)**: Strictly number-only in kg.
+    - **Gender (Jenis Kelamin)**: Dropdown selection (`Male`, `Female`, `Non-binary`).
+    - **Extra Attributes**: Attribute selector list (Pekerjaan, Hobi, Status, Kepribadian, or custom key-value).
+- **Compact Persona Selector in Chat (`index.html`)**:
+  - Replaced the bulky key-value memory editor in the chat memory modal with a compact 1-click persona selector.
+  - Displays selected persona chips with index and name, plus an active summary badge and direct link to Settings.
+- **Dedicated Donation Page (`donate.html` & `donate.css`)**:
+  - Standalone donation page supporting Saweria (QRIS, e-wallet, bank transfer) and Ko-fi (PayPal, Card), with GitHub Sponsors noted as under review.
+  - Interactive quick-copy link buttons with clipboard feedback toast notifications.
+  - Added direct donation button beside the Settings button on the welcome screen (`index.html`) and in the sidebar header.
+- **REST Endpoints for Persona in `server.js`**:
+  - `GET /api/personas`, `GET /api/personas/:id`, `POST /api/personas`, `PUT /api/personas/:id`, `DELETE /api/personas/:id`.
+
+### Changed
+- **Memory Cleaner & Heuristic Regex Removal (`server.js`)**:
+  - Migrated 135 memory files to reference central `personaId` instead of bulky redundant `userPreferences` blocks.
+  - Removed imprecise regex heuristic auto-filling of name and age from `autoExtractMemory()`, ensuring persona attributes remain exact and user-controlled.
+  - Chat completions (`/api/chat/send` and `/api/chat/regenerate`) now resolve and format active persona details cleanly into `## What You Know About the User`.
+
+---
+
+## [v1.4.1] — Thinking Mode Off by Default & Response Length Tuning
+
+Disables chain-of-thought / reasoning tokens (`<think>...</think>`) by default
+across all notebook servers and client requests, and refines the character roleplay
+system prompt to enforce concise 4–6 sentence responses.
+
+### Added
+- **Native thinking / reasoning toggle (`ENABLE_THINKING = False`)**:
+  - Configurable in `Collab-Llama.py`, `Collab-Llama-Private.py`, `Kaggle-Llama.py`,
+    and `Kaggle-Llama-Private.py`.
+  - Added `--reasoning off --chat-template-kwargs '{"enable_thinking": false}'`
+    to `llama-server` CLI startup flags when disabled, turning off reasoning at
+    both the llama.cpp engine and Jinja chat template levels.
+  - Added `chat_template_kwargs: {"enable_thinking": False}` to the startup
+    1-token completion test in all notebook scripts.
+  - Added `Thinking : OFF` indicator in the server ready banner.
+- **Environment configuration (`ENABLE_THINKING`)** in `.env` and `.env.example`:
+  - Set to `false` by default to disable thinking tokens on reasoning-capable
+    models (e.g. Qwen 2.5/3, DeepSeek-R1).
+- **Client-side request kwargs and fallback filter** in `server.js`:
+  - Automatically sends `chat_template_kwargs: { enable_thinking: false }` via
+    `getModelParams()` on every `/api/chat` and `/api/chat/regenerate` request.
+  - Added `cleanAssistantResponse()` helper to strip any completed or unclosed
+    `<think>...</think>` tags if a reasoning model leaks thought tokens into the output text.
+
+### Changed
+- **Response length accuracy in roleplay rules** (`server.js`):
+  - Refined system prompt in `/api/chat` and `/api/chat/regenerate` from
+    `1-2 short paragraphs` to `1-2 short paragraphs (4-6 sentences total)` to provide
+    a concrete, measurable sentence-count target for more consistent response lengths.
+
+---
+
+## [v1.3.1] — Multi-GPU auto-detect build (T4 / A100 / L4 / RTX / H100)
+
+No more manually editing `CUDA_ARCH` every time you switch GPU type in
+Colab or Kaggle. One prebuilt tarball now covers every GPU generation
+these notebooks are likely to run on, and the consumer notebooks detect
+your hardware automatically.
+
+### Added
+- **Fat multi-arch CUDA build.** `Build-Llama-CUDA-Release.py` now compiles
+  native code for Turing (T4, `sm_75`), Ampere-DC (A100, `sm_80`), Ampere
+  (RTX 30-series, `sm_86`), Ada (L4 / RTX 40-series, `sm_89`), and Hopper
+  (H100, `sm_90`) into a single tarball, plus an `sm_90` PTX ("virtual")
+  entry so GPUs newer than Hopper can still run it via the driver's JIT
+  instead of requiring a rebuild.
+- **Runtime GPU auto-detection** in `Collab-Llama.py` and `Kaggle-Llama.py`
+  (`detect_gpu_arch()`), reading compute capability straight from
+  `nvidia-smi`. `CUDA_ARCH` is no longer a hardcoded config value — it's
+  resolved automatically before anything else runs.
+- **Coverage-aware prebuilt verification.** `verify_prebuilt()` now checks
+  whether the detected GPU is covered by the tarball's embedded arch list
+  (native match, or new enough for the PTX forward-compat entry to JIT)
+  instead of requiring an exact single-arch string match. A prebuilt from
+  before this update, or one that genuinely doesn't cover the attached GPU,
+  is rejected with a clear reason and the notebook falls back to compiling
+  from source for that GPU's specific arch.
+- `VERSION.txt` now records a `cuda_archs` field (semicolon-separated,
+  `-real`/`-virtual` tagged) instead of a single `cuda_arch` value, plus a
+  `cuda_archs_human` line for quick eyeballing.
+
+### Fixed
+- **Critical: `CMAKE_CUDA_ARCHITECTURES` value was silently truncated to
+  the first architecture.** The cmake invocation is run through a shell,
+  and the semicolon-separated arch list (`75-real;80-real;86-real;...`)
+  was passed unquoted — so the shell parsed everything after the first
+  semicolon as separate commands (`80-real: not found`, `86-real: not
+  found`, etc.) instead of one argument. Only `sm_75` ever actually got
+  built, silently. Fixed by quoting the value
+  (`-DCMAKE_CUDA_ARCHITECTURES="{CUDA_ARCH}"`), confirmed to affect every
+  multi-arch build produced before this patch.
+- **`find_cuda_driver_lib()` missed the driver library location on some
+  Kaggle images.** `nvidia-smi` succeeds (kernel driver is loaded), but no
+  `libcuda.so`/`libcuda.so.1` existed in any of the previously-checked
+  toolkit/system paths, so the CUDA configure step failed at
+  `target_link_libraries(ggml-cuda ... CUDA::cuda_driver)` with "target not
+  found" — and the `GGML_CUDA_NO_VMM=ON` retry hit the identical error,
+  since that flag doesn't actually drop the driver-link requirement in this
+  llama.cpp revision. Added the `nvidia-container-toolkit` mount paths
+  (`/usr/local/nvidia/lib64`, `/usr/lib/nvidia`, etc.) to the search list,
+  plus a bounded filesystem sweep as a last resort before giving up.
+
+### Changed
+- Prebuilt tarball naming: `llama-cuda-sm{N}-{tag}.tar.gz` →
+  `llama-cuda-multiarch-{tag}.tar.gz` (one asset now serves every GPU type
+  instead of one asset per arch).
+- Build time for `Build-Llama-CUDA-Release.py` increases from ~5-10 min
+  (single arch) to ~15-25 min (five archs + PTX) — paid once per
+  `LLAMA_CPP_TAG` bump, not per notebook run.
+
+### Migration notes
+- Re-run `Build-Llama-CUDA-Release.py` and re-upload the resulting tarball
+  — old single-arch releases won't satisfy the new coverage check on any
+  GPU other than the one they were originally built for.
+- Update `GITHUB_RELEASE_URL` in `Collab-Llama.py` / `Kaggle-Llama.py` to
+  point at the new `llama-cuda-multiarch-*.tar.gz` asset.
+- No other config changes needed — `CUDA_ARCH` is auto-managed from here on.
+
+## [v1.0.0] — llama.cpp migration + stability pass
+
+### Added
+- **`Collab-Llama.py`** — new one-click Colab notebook script. Runs `llama-server`
+  (llama.cpp) directly, no Ollama/LiteLLM in the path.
+- **`Kaggle-Llama.py`** — same, for Kaggle's dual-T4 environment. Preserves the
+  original `kaggle_llm_server.py`'s dual-GPU verification and RAM/VRAM cleanup
+  handler (`atexit`/`SIGTERM`).
+- **`Build-Llama-CUDA-Release.py`** — one-time builder that packages a portable
+  `llama-server` (CUDA) tarball for upload to your own GitHub Release, so
+  future runs can skip compiling from source.
+- **CUDA driver linking fix** (`find_cuda_driver_lib()` / `cuda_driver_cmake_flags()`)
+  in all three build scripts above: works around `CUDA::cuda_driver` target
+  not found during CMake configure on Kaggle/Colab images that don't expose
+  an unversioned `libcuda.so`. Two-tier fallback — symlink a found driver lib
+  first, or disable the CUDA VMM allocator (`GGML_CUDA_NO_VMM=ON`) as a last
+  resort if no driver library is discoverable at all. Verified against a
+  real Kaggle T4 build.
+- `safePath()` helper in `server.js` — strict UUID-allowlist path
+  construction, applied to every character/chat/memory file endpoint.
+- Native llama.cpp sampling parameters in `server.js` / `.env.example`:
+  `TOP_K`, `TOP_P`, `MIN_P`, `TYPICAL_P`, `TFS_Z`, `TOP_N_SIGMA`,
+  `REPEAT_LAST_N`, `REPEAT_PENALTY`, `DRY_*` (full DRY sampling),
+  `XTC_*`, `DYNATEMP_*`, `MIROSTAT*`, `SEED`, `SAMPLERS` — with type/range/
+  NaN/Infinity validation on every value (logs a warning and falls back to
+  default instead of silently misbehaving or crashing).
+- "Unread" indicator (sidebar dot) in `app.js` for chats whose reply arrived
+  while you were viewing a different chat.
+- Character/chat ownership check in `send`/`regenerate`/`summarize` — a chat
+  can no longer be processed under the wrong character's persona/memory.
+
+### Changed
+- **Default LLM stack is now `llama-server` (llama.cpp) via Cloudflare
+  Tunnel** — no LiteLLM proxy, no Ollama. README and `.env.example` rewritten
+  to describe this as the primary path.
+- `server.js`'s `getModelParams()` fully rewritten: one canonical native
+  param set instead of an OpenAI/Ollama-flavored mix.
+- Model download (in the new notebooks) uses `huggingface_hub`'s
+  `snapshot_download(local_dir=...)` directly instead of relying on
+  `llama-server`'s built-in `-hf` downloader — keeps the model out of the
+  default HF cache entirely (no duplicate on-disk copy), with Xet chunk
+  caching disabled by default (`HF_XET_CHUNK_CACHE_SIZE_BYTES=0`).
+- Notebook readiness check replaced with an explicit state machine
+  (`PROCESS_STARTED → MODEL_LOADING → HEALTH_READY → TUNNEL_READY`) using
+  `llama-server`'s real `/health` semantics (503 while loading, 200 once
+  ready) instead of a generic "any non-5xx" guess. "SERVER IS READY" is only
+  printed after a real 1-token completion request succeeds end-to-end.
+- `.env` writer (`POST /api/config`) no longer uses a raw string in
+  `String.replace()` — a pasted URL containing `$&`/`$1` used to corrupt the
+  `.env` file; now uses a replacer function.
+- `writeJSON()` is atomic (write to `.tmp`, then rename) — an interrupted
+  write can no longer leave a truncated/corrupted chat or character file.
+- `/api/chat/send` and `/api/chat/regenerate` now re-read the chat from disk
+  immediately before writing, instead of reusing the copy loaded before the
+  5–120s LLM call — an edit or regenerate made on the same chat while
+  waiting is no longer silently reverted.
+- Regenerate's alternate-resolution now happens *before* building the
+  message history sent to the model, not after — a rejected/stale reply is
+  no longer resent to the model on the next turn.
+- `appendMessage()` in `app.js` now sets `data-index` on creation — the
+  edit (✏️) button works immediately instead of only after a chat
+  switch/reload.
+- `escapeHtml()` now also escapes quotes (`"`/`'`), not just `&`/`<`/`>` —
+  fixes several call sites that interpolate its output inside quoted HTML
+  attributes.
+- Avatar `src` values are now escaped before interpolation — a malformed or
+  malicious avatar string (e.g. from an imported character card) can no
+  longer break out of the `<img>` tag.
+- `api()` in `app.js` now checks `res.ok` and handles non-JSON error bodies
+  instead of throwing an unhandled parse error that silently broke the
+  init chain (empty sidebar, dead buttons, no visible error).
+- `sendMessage()`/`regenerateLastMessage()` capture `state.currentChatId`/
+  `state.currentCharacterId` into local variables before any `await`, and
+  re-check before rendering — switching chats mid-request no longer renders
+  (or saves) a reply into the wrong chat.
+- Failed sends now remove the optimistic "phantom" user bubble and restore
+  the typed text, instead of leaving a bubble on screen for a message that
+  was never actually saved.
+
+### Fixed
+- **Path traversal (C1)** — every file-path construction from user input now
+  goes through `safePath()`. Verified with a live server against `../`,
+  `../../`, `..%2f`, `%2e%2e`, `..%5c`, absolute paths, `package.json`,
+  `karakter`, and more — all correctly rejected with 400, no file touched,
+  server stays up.
+- **Crash on malformed `chat.messages` (C2)** — `PUT /api/chat/:chatId` now
+  rejects a non-array `messages` field at the source; defensive guards added
+  in `send`/`regenerate`/`summarize` for any already-corrupted data.
+- **Crash on `null` entries in `importantEvents` (C3)** — filtered at save
+  time and defensively at read time.
+- **Prototype pollution via `messageIndex` (H1)** — `messageIndex` is now
+  validated as a real non-negative integer before use; `"__proto__"` and
+  similar can no longer reach `Array.prototype`.
+- **Double-click race in alternate navigation** — concurrent clicks used to
+  each read a stale `selectedAlternate` and could overwrite each other,
+  leaving the counter stuck. Now guarded with a per-message in-flight lock.
+- **Regenerate had no busy-state feedback** — pressing Enter during a
+  regenerate silently no-op'd; now shows a toast and disables the send
+  button.
+- **Regenerating a chat's first message sent zero conversation turns** to
+  the model (only the system prompt) — now injects a minimal opening
+  instruction so the model always has something to respond to.
+- **Heuristic memory-extraction false positive** — `"hai suka gak sama
+  aku?"` was misread as a "likes" fact because the pronoun pattern lacked a
+  word boundary (matched the trailing "i" in "hai"). Fixed with `\b`.
+- **`abort` timer leak** on every failed/errored LLM fetch attempt (was only
+  cleared on the success path).
+- **API key mismatch confusion (H11)** — Colab and Kaggle notebooks issue
+  different default keys (`sk-colab-local` / `sk-kaggle-local`); a 401 now
+  gets an explicit, actionable error message instead of a generic failure.
+- **Kaggle warm-up check accepted a 404 as "ready" (H12)** — now requires an
+  exact `200`.
+- **Colab's `ollama pull` died on a known transient blob-race error (H10)**
+  — retry logic ported from the Kaggle script; stale server processes from a
+  re-run are now killed before starting a fresh one.
+- Hardcoded `lang="id"` in `index.html` → now defaults to `en` and is set
+  dynamically once the actual UI language loads; RTL (`dir="rtl"`) applied
+  for Arabic.
+- `[data-i18n-title]` attributes (4 elements) were never translated —
+  handler added.
+- `state.config` lost `uiLang`/`showLangWarning` after saving settings
+  (object replacement instead of merge) — fixed.
+
+### Deprecated
+- `colab_llm_server.py` / `colab_llm_server.ipynb` / `kaggle_llm_server.py`
+  (the Ollama + LiteLLM stack) are kept in the repo as an explicitly-labeled
+  optional alternative — no longer the default path, not actively developed
+  further.
+
+### Known remaining issues (see project bug tracker / next session)
+- Memory write-back (`autoExtractMemory`, `/summarize`) still writes using
+  the copy of `memory` loaded at the start of the request rather than
+  re-reading fresh immediately before `writeJSON` — a manual memory edit
+  made while the LLM is generating can still be overwritten. (Chat writes
+  already got this fix; memory did not yet.)
+- Frontend async race-condition audit (capture-ID-before-`await` pattern) not
+  yet confirmed complete for every async function — only `sendMessage`,
+  `regenerateLastMessage`, and `changeAlternate` are confirmed fixed.
+- Full `app.js` XSS audit (memory fields, event dates, facts, preferences,
+  locale values) not yet done end-to-end.
+- LLM request retry/timeout audit (distinguishing timeout from HTTP failure,
+  unsafe POST retries) not yet done.
