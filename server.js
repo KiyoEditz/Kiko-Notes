@@ -12,24 +12,93 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { v4: uuidv4 } = require('uuid');
+const memoryDb = require('./lib/memory-db');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ── Data directories ────────────────────────────────────────
 const DATA_DIR = path.join(__dirname, 'data');
-const CHARACTERS_DIR = path.join(DATA_DIR, 'characters');
+const MODEL_DIR = path.join(DATA_DIR, 'model');
+const MODEL_CONFIG_PATH = path.join(MODEL_DIR, 'config.json');
 const CHATS_DIR = path.join(DATA_DIR, 'chats');
-const PRIVATE_CHATS_DIR = path.join(CHATS_DIR, 'private');
-const GROUP_CHATS_DIR = path.join(CHATS_DIR, 'groups');
 const MEMORY_DIR = path.join(DATA_DIR, 'memory');
-const PRIVATE_MEMORY_DIR = path.join(MEMORY_DIR, 'private');
-const GROUP_MEMORY_DIR = path.join(MEMORY_DIR, 'groups');
+const MEMORY_FILE_PATH = path.join(MEMORY_DIR, 'memory.json');
+const CHAT_DUMP_DIR = path.join(DATA_DIR, 'Chat-Dump');
 const PERSONA_DIR = path.join(DATA_DIR, 'persona');
 
-[DATA_DIR, CHARACTERS_DIR, CHATS_DIR, PRIVATE_CHATS_DIR, GROUP_CHATS_DIR, MEMORY_DIR, PRIVATE_MEMORY_DIR, GROUP_MEMORY_DIR, PERSONA_DIR].forEach(dir => {
+// Legacy directories (kept as constants only for migration/cleanup)
+const CHARACTERS_DIR = path.join(DATA_DIR, 'characters');
+const PRIVATE_CHATS_DIR = path.join(CHATS_DIR, 'private');
+const GROUP_CHATS_DIR = path.join(CHATS_DIR, 'groups');
+const PRIVATE_MEMORY_DIR = path.join(MEMORY_DIR, 'private');
+const GROUP_MEMORY_DIR = path.join(MEMORY_DIR, 'groups');
+
+[DATA_DIR, MODEL_DIR, CHATS_DIR, MEMORY_DIR, CHAT_DUMP_DIR, PERSONA_DIR].forEach(dir => {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
+
+function migrateLegacyDataLayout() {
+    try {
+        // 1. Migrate data/characters/*.json -> data/model/config.json
+        if (fs.existsSync(CHARACTERS_DIR)) {
+            if (!fs.existsSync(MODEL_CONFIG_PATH)) {
+                const charFiles = fs.readdirSync(CHARACTERS_DIR).filter(f => f.endsWith('.json'));
+                if (charFiles.length > 0) {
+                    const firstChar = readJSON(path.join(CHARACTERS_DIR, charFiles[0]));
+                    if (firstChar) writeJSON(MODEL_CONFIG_PATH, firstChar);
+                }
+            }
+            fs.rmSync(CHARACTERS_DIR, { recursive: true, force: true });
+        }
+
+        // 2. Migrate data/chats/private/<charId>/*.json -> data/chats/*.json
+        if (fs.existsSync(PRIVATE_CHATS_DIR)) {
+            const entries = fs.readdirSync(PRIVATE_CHATS_DIR, { withFileTypes: true });
+            for (const ent of entries) {
+                const fullEnt = path.join(PRIVATE_CHATS_DIR, ent.name);
+                if (ent.isDirectory()) {
+                    const chatFiles = fs.readdirSync(fullEnt).filter(f => f.endsWith('.json'));
+                    for (const cf of chatFiles) {
+                        const dest = path.join(CHATS_DIR, cf);
+                        if (!fs.existsSync(dest)) {
+                            fs.renameSync(path.join(fullEnt, cf), dest);
+                        }
+                    }
+                } else if (ent.isFile() && ent.name.endsWith('.json')) {
+                    const dest = path.join(CHATS_DIR, ent.name);
+                    if (!fs.existsSync(dest)) fs.renameSync(fullEnt, dest);
+                }
+            }
+            fs.rmSync(PRIVATE_CHATS_DIR, { recursive: true, force: true });
+        }
+        if (fs.existsSync(GROUP_CHATS_DIR)) {
+            fs.rmSync(GROUP_CHATS_DIR, { recursive: true, force: true });
+        }
+
+        // 3. Migrate data/memory/private/*.json -> data/memory/memory.json
+        if (fs.existsSync(PRIVATE_MEMORY_DIR)) {
+            if (!fs.existsSync(MEMORY_FILE_PATH)) {
+                const memFiles = fs.readdirSync(PRIVATE_MEMORY_DIR).filter(f => f.endsWith('.json'));
+                if (memFiles.length > 0) {
+                    const firstMem = readJSON(path.join(PRIVATE_MEMORY_DIR, memFiles[0]));
+                    if (firstMem) writeJSON(MEMORY_FILE_PATH, firstMem);
+                }
+            }
+            fs.rmSync(PRIVATE_MEMORY_DIR, { recursive: true, force: true });
+        }
+        if (fs.existsSync(GROUP_MEMORY_DIR)) {
+            fs.rmSync(GROUP_MEMORY_DIR, { recursive: true, force: true });
+        }
+    } catch (err) {
+        console.error('Failed to migrate legacy data layout:', err);
+    }
+}
+migrateLegacyDataLayout();
+
+const MEMORY_DB_PATH = path.join(MEMORY_DIR, 'memory.db');
+memoryDb.initMemoryDb(MEMORY_DB_PATH);
+memoryDb.importFromJsonFiles({ chatsDir: CHATS_DIR, memoryFilePath: MEMORY_FILE_PATH });
 
 // ── Helper: safe path construction (path traversal fix) ──────
 // Every ID in this app is a crypto.randomUUID() string. A strict allowlist
@@ -49,47 +118,9 @@ function safePath(baseDir, id) {
     return resolved;
 }
 
-function safeGroupChatPath(groupId, chatId) {
-    if (typeof groupId !== 'string' || !ID_RE.test(groupId)) return null;
-    if (typeof chatId !== 'string' || !ID_RE.test(chatId)) return null;
-    const groupDir = path.resolve(GROUP_CHATS_DIR, groupId);
-    const resolvedBase = groupDir + path.sep;
-    const resolved = path.resolve(groupDir, `${chatId}.json`);
-    if (!resolved.startsWith(resolvedBase)) return null;
-    return resolved;
-}
-
-function safePrivateChatPath(characterId, chatId) {
-    if (typeof characterId !== 'string' || !ID_RE.test(characterId)) return null;
-    if (typeof chatId !== 'string' || !ID_RE.test(chatId)) return null;
-    const charDir = path.resolve(PRIVATE_CHATS_DIR, characterId);
-    const resolvedBase = charDir + path.sep;
-    const resolved = path.resolve(charDir, `${chatId}.json`);
-    if (!resolved.startsWith(resolvedBase)) return null;
-    return resolved;
-}
-
-function findPrivateChatPath(chatId, characterId = null) {
-    if (typeof chatId !== 'string' || !ID_RE.test(chatId)) return null;
-    if (characterId && typeof characterId === 'string' && ID_RE.test(characterId)) {
-        const p = safePrivateChatPath(characterId, chatId);
-        if (p && fs.existsSync(p)) return p;
-    }
-    // Search within character subdirectories
-    if (fs.existsSync(PRIVATE_CHATS_DIR)) {
-        const entries = fs.readdirSync(PRIVATE_CHATS_DIR, { withFileTypes: true });
-        for (const ent of entries) {
-            if (ent.isDirectory() && ID_RE.test(ent.name)) {
-                const candidate = path.join(PRIVATE_CHATS_DIR, ent.name, `${chatId}.json`);
-                if (fs.existsSync(candidate)) {
-                    return candidate;
-                }
-            }
-        }
-    }
-    // Fallback to legacy root path just in case
-    const legacy = safePath(PRIVATE_CHATS_DIR, chatId);
-    if (legacy && fs.existsSync(legacy)) return legacy;
+function findPrivateChatPath(chatId) {
+    const p = safePath(CHATS_DIR, chatId);
+    if (p && fs.existsSync(p)) return p;
     return null;
 }
 
@@ -312,26 +343,25 @@ app.post('/api/config', (req, res) => {
 // ══════════════════════════════════════════════════════════════
 
 app.get('/api/characters', (req, res) => {
-    const files = fs.readdirSync(CHARACTERS_DIR).filter(f => f.endsWith('.json'));
-    const chars = files.map(f => readJSON(path.join(CHARACTERS_DIR, f))).filter(Boolean);
-    chars.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
-    res.json(chars);
+    const char = fs.existsSync(MODEL_CONFIG_PATH) ? readJSON(MODEL_CONFIG_PATH) : null;
+    res.json(char ? [char] : []);
 });
 
 app.get('/api/characters/:id', (req, res) => {
-    const fp = safePath(CHARACTERS_DIR, req.params.id);
-    if (!fp) return res.status(400).json({ error: 'Invalid character id' });
-    const char = readJSON(fp);
-    if (!char) return res.status(404).json({ error: 'Character not found' });
+    const char = fs.existsSync(MODEL_CONFIG_PATH) ? readJSON(MODEL_CONFIG_PATH) : null;
+    if (!char || (req.params.id !== char.id && req.params.id !== 'default')) {
+        return res.status(404).json({ error: 'Model config not found' });
+    }
     res.json(char);
 });
 
 app.post('/api/characters', (req, res) => {
-    const id = uuidv4();
+    const existing = fs.existsSync(MODEL_CONFIG_PATH) ? readJSON(MODEL_CONFIG_PATH) : null;
+    const id = (existing && existing.id) || uuidv4();
     const now = new Date().toISOString();
     const char = {
         id,
-        name: req.body.name || 'Unnamed',
+        name: req.body.name || 'Assistant',
         gender: req.body.gender || '',
         age: req.body.age || '',
         avatar: req.body.avatar || '',
@@ -341,28 +371,28 @@ app.post('/api/characters', (req, res) => {
         exampleDialogue: req.body.exampleDialogue || '',
         systemPrompt: req.body.systemPrompt || '',
         tags: req.body.tags || [],
-        createdAt: now,
+        createdAt: (existing && existing.createdAt) || now,
         updatedAt: now
     };
-    writeJSON(path.join(CHARACTERS_DIR, `${id}.json`), char);
+    writeJSON(MODEL_CONFIG_PATH, char);
 
-    // Initialize memory for this character
-    writeJSON(path.join(PRIVATE_MEMORY_DIR, `${id}.json`), normalizeMemoryDoc({
-        characterId: id,
-        facts: [],
-        summaries: [],
-        importantEvents: [],
-        personaId: '1',
-        lastUpdated: now
-    }, 'characterId', id, '1'));
+    // Initialize memory if not exists
+    if (!fs.existsSync(MEMORY_FILE_PATH)) {
+        writeJSON(MEMORY_FILE_PATH, normalizeMemoryDoc({
+            characterId: id,
+            facts: [],
+            summaries: [],
+            importantEvents: [],
+            personaId: '1',
+            lastUpdated: now
+        }, 'characterId', id, '1'));
+    }
 
     res.json(char);
 });
 
 app.put('/api/characters/:id', (req, res) => {
-    const fp = safePath(CHARACTERS_DIR, req.params.id);
-    if (!fp) return res.status(400).json({ error: 'Invalid character id' });
-    const existing = readJSON(fp);
+    const existing = fs.existsSync(MODEL_CONFIG_PATH) ? readJSON(MODEL_CONFIG_PATH) : null;
     if (!existing) return res.status(404).json({ error: 'Not found' });
 
     const updated = {
@@ -380,41 +410,36 @@ app.put('/api/characters/:id', (req, res) => {
         createdAt: existing.createdAt,
         updatedAt: new Date().toISOString()
     };
-    writeJSON(fp, updated);
+    writeJSON(MODEL_CONFIG_PATH, updated);
     res.json(updated);
 });
 
 app.delete('/api/characters/:id', (req, res) => {
-    const fp = safePath(CHARACTERS_DIR, req.params.id);
-    const memFp = safePath(PRIVATE_MEMORY_DIR, req.params.id);
-    if (!fp || !memFp) return res.status(400).json({ error: 'Invalid character id' });
-    if (fs.existsSync(fp)) fs.unlinkSync(fp);
-    // Also delete associated memory
-    if (fs.existsSync(memFp)) fs.unlinkSync(memFp);
-    // Delete all chats for this character
-    const charChatDir = path.join(PRIVATE_CHATS_DIR, req.params.id);
-    if (fs.existsSync(charChatDir)) {
-        fs.rmSync(charChatDir, { recursive: true, force: true });
+    if (fs.existsSync(MODEL_CONFIG_PATH)) fs.unlinkSync(MODEL_CONFIG_PATH);
+    if (fs.existsSync(MEMORY_FILE_PATH)) fs.unlinkSync(MEMORY_FILE_PATH);
+    if (fs.existsSync(CHATS_DIR)) {
+        for (const f of fs.readdirSync(CHATS_DIR).filter(f => f.endsWith('.json'))) {
+            fs.unlinkSync(path.join(CHATS_DIR, f));
+        }
     }
     res.json({ ok: true });
 });
 
 // ══════════════════════════════════════════════════════════════
-//  CHAT HISTORY API (PRIVATE)
+//  CHAT HISTORY API
 // ══════════════════════════════════════════════════════════════
 
-// List all chats for a character
+// List all chats
 app.get('/api/chats/:characterId', (req, res) => {
-    const charDir = path.join(PRIVATE_CHATS_DIR, req.params.characterId);
     let chats = [];
-    if (fs.existsSync(charDir)) {
-        const files = fs.readdirSync(charDir).filter(f => f.endsWith('.json'));
+    if (fs.existsSync(CHATS_DIR)) {
+        const files = fs.readdirSync(CHATS_DIR).filter(f => f.endsWith('.json'));
         chats = files
-            .map(f => readJSON(path.join(charDir, f)))
-            .filter(c => c && c.characterId === req.params.characterId)
+            .map(f => readJSON(path.join(CHATS_DIR, f)))
+            .filter(Boolean)
             .map(c => ({
                 id: c.id,
-                characterId: c.characterId,
+                characterId: c.characterId || req.params.characterId,
                 title: c.title || 'Untitled Chat',
                 messageCount: (c.messages || []).length,
                 createdAt: c.createdAt,
@@ -451,9 +476,6 @@ app.get('/api/chat/:chatId', (req, res) => {
 
 // Create new chat
 app.post('/api/chats', (req, res) => {
-    if (!req.body.characterId || typeof req.body.characterId !== 'string' || !ID_RE.test(req.body.characterId)) {
-        return res.status(400).json({ error: 'Valid characterId is required' });
-    }
     const id = uuidv4();
     const now = new Date().toISOString();
     const rawMessages = Array.isArray(req.body.messages) ? req.body.messages : [];
@@ -463,17 +485,14 @@ app.post('/api/chats', (req, res) => {
     }));
     const chat = {
         id,
-        characterId: req.body.characterId,
+        characterId: req.body.characterId || 'default',
         title: req.body.title || 'New Chat',
         messages,
         createdAt: now,
         updatedAt: now
     };
-    const targetDir = path.join(PRIVATE_CHATS_DIR, req.body.characterId);
-    if (!fs.existsSync(targetDir)) {
-        fs.mkdirSync(targetDir, { recursive: true });
-    }
-    writeJSON(path.join(targetDir, `${id}.json`), chat);
+    writeJSON(path.join(CHATS_DIR, `${id}.json`), chat);
+    memoryDb.syncChatToDb(chat);
     res.json(chat);
 });
 
@@ -513,6 +532,7 @@ app.put('/api/chat/:chatId', (req, res) => {
         updatedAt: new Date().toISOString()
     };
     writeJSON(fp, updated);
+    memoryDb.syncChatToDb(updated);
     res.json(updated);
 });
 
@@ -521,442 +541,51 @@ app.delete('/api/chat/:chatId', (req, res) => {
     const fp = findPrivateChatPath(req.params.chatId);
     if (!fp) return res.status(404).json({ error: 'Chat not found' });
     if (fs.existsSync(fp)) fs.unlinkSync(fp);
+    memoryDb.deleteChatFromDb(req.params.chatId);
     res.json({ ok: true });
 });
 
-// ══════════════════════════════════════════════════════════════
-//  GROUP CHAT CRUD API
-// ══════════════════════════════════════════════════════════════
-
-// List all groups
-app.get('/api/groups', (req, res) => {
-    try {
-        const files = fs.readdirSync(GROUP_CHATS_DIR).filter(f => f.endsWith('.json'));
-        const groups = files
-            .map(f => readJSON(path.join(GROUP_CHATS_DIR, f)))
-            .filter(Boolean)
-            .map(g => {
-                let messageCount = 0;
-                const sessionDir = path.join(GROUP_CHATS_DIR, g.id);
-                if (fs.existsSync(sessionDir)) {
-                    try {
-                        const sFiles = fs.readdirSync(sessionDir).filter(sf => sf.endsWith('.json'));
-                        for (const sf of sFiles) {
-                            const sChat = readJSON(path.join(sessionDir, sf));
-                            if (sChat && Array.isArray(sChat.messages)) {
-                                messageCount += sChat.messages.length;
-                            }
-                        }
-                    } catch (e) {
-                        console.error('Error calculating group messageCount:', e);
-                    }
-                }
-                if (messageCount === 0 && Array.isArray(g.messages)) {
-                    messageCount = g.messages.length;
-                }
-
-                return {
-                    id: g.id,
-                    name: g.name || 'Untitled Group',
-                    avatar: g.avatar || '',
-                    scenario: g.scenario || '',
-                    characterIds: Array.isArray(g.characterIds) ? g.characterIds : [],
-                    activePersonaId: g.activePersonaId || null,
-                    messageCount,
-                    createdAt: g.createdAt,
-                    updatedAt: g.updatedAt
-                };
-            });
-        groups.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
-        res.json(groups);
-    } catch (err) {
-        console.error('Error listing groups:', err);
-        res.status(500).json({ error: 'Failed to list groups' });
-    }
-});
-
-// Get single group
-app.get('/api/groups/:id', (req, res) => {
-    const fp = safePath(GROUP_CHATS_DIR, req.params.id);
-    if (!fp) return res.status(400).json({ error: 'Invalid group id' });
-    const group = readJSON(fp);
-    if (!group) return res.status(404).json({ error: 'Group not found' });
-    res.json(group);
-});
-
-// Create new group
-app.post('/api/groups', (req, res) => {
-    const { name, avatar, scenario, characterIds, activePersonaId } = req.body;
-    if (!name || typeof name !== 'string' || !name.trim()) {
-        return res.status(400).json({ error: 'Group name is required' });
-    }
-    if (!Array.isArray(characterIds) || characterIds.length === 0) {
-        return res.status(400).json({ error: 'Group must have at least one character' });
+// Dump clean single-session dataset to data/Chat-Dump/<chatId>.json
+app.post('/api/chat/:chatId/dump', (req, res) => {
+    const fp = findPrivateChatPath(req.params.chatId);
+    if (!fp) return res.status(404).json({ error: 'Chat not found' });
+    const chat = readJSON(fp);
+    if (!chat || !Array.isArray(chat.messages)) {
+        return res.status(404).json({ error: 'Chat not found' });
     }
 
-    const id = uuidv4();
-    const now = new Date().toISOString();
-    const group = {
-        id,
-        name: name.trim(),
-        avatar: avatar || '',
-        scenario: scenario || '',
-        characterIds: characterIds,
-        activePersonaId: activePersonaId || null,
-        messages: [],
-        createdAt: now,
-        updatedAt: now
-    };
-    writeJSON(path.join(GROUP_CHATS_DIR, `${id}.json`), group);
-
-    // Initialize group session directory and first session
-    const sessionDir = path.join(GROUP_CHATS_DIR, id);
-    if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
-    const firstChatId = uuidv4();
-    const firstChat = {
-        id: firstChatId,
-        groupId: id,
-        title: 'New Chat',
-        messages: [],
-        createdAt: now,
-        updatedAt: now
-    };
-    writeJSON(path.join(sessionDir, `${firstChatId}.json`), firstChat);
-
-    // Also initialize group memory in GROUP_MEMORY_DIR
-    const memFp = path.join(GROUP_MEMORY_DIR, `${id}.json`);
-    const initGroupPersonaId = String(activePersonaId || '1');
-    writeJSON(memFp, normalizeMemoryDoc({
-        groupId: id,
-        facts: [],
-        summaries: [],
-        importantEvents: [],
-        personaId: initGroupPersonaId,
-        lastUpdated: now
-    }, 'groupId', id, initGroupPersonaId));
-
-    res.json(group);
-});
-
-// Update group
-app.put('/api/groups/:id', (req, res) => {
-    const fp = safePath(GROUP_CHATS_DIR, req.params.id);
-    if (!fp) return res.status(400).json({ error: 'Invalid group id' });
-    const existing = readJSON(fp);
-    if (!existing) return res.status(404).json({ error: 'Group not found' });
-
-    // Ensure session directory exists for this group
-    const sessionDir = path.join(GROUP_CHATS_DIR, req.params.id);
-    if (!fs.existsSync(sessionDir)) {
-        fs.mkdirSync(sessionDir, { recursive: true });
-    }
-
-    // If existing has legacy messages and sessionDir is empty, migrate them to a session
-    const sFiles = fs.readdirSync(sessionDir).filter(f => f.endsWith('.json'));
-    if (sFiles.length === 0 && Array.isArray(existing.messages) && existing.messages.length > 0) {
-        const firstChatId = uuidv4();
-        const now = new Date().toISOString();
-        const firstChat = {
-            id: firstChatId,
-            groupId: req.params.id,
-            title: 'New Chat',
-            messages: existing.messages,
-            createdAt: existing.createdAt || now,
-            updatedAt: existing.updatedAt || now
-        };
-        writeJSON(path.join(sessionDir, `${firstChatId}.json`), firstChat);
-    }
-
-    let groupMessages = existing.messages || [];
-    if (Array.isArray(req.body.messages) && req.body.messages.length > 0) {
-        const existingById = new Map((existing.messages || []).filter(em => em && em.id).map(em => [em.id, em]));
-        groupMessages = req.body.messages.map((m, idx) => {
-            const prev = (m.id && existingById.get(m.id)) || (existing.messages || [])[idx];
-            const merged = {
-                ...(prev && prev.alternates ? { alternates: prev.alternates, selectedAlternate: prev.selectedAlternate } : {}),
-                ...m,
-                id: m.id || (prev && prev.id) || uuidv4()
-            };
-            if (Array.isArray(merged.alternates) && merged.selectedAlternate !== undefined && merged.content !== undefined) {
-                merged.alternates = [...merged.alternates];
-                merged.alternates[merged.selectedAlternate] = merged.content;
-            }
-            return merged;
+    const normalizedMessages = [];
+    for (const m of chat.messages) {
+        if (!m || (m.role !== 'user' && m.role !== 'assistant')) continue;
+        const content = (Array.isArray(m.alternates) && m.selectedAlternate !== undefined)
+            ? (m.alternates[m.selectedAlternate] ?? m.content ?? '')
+            : (m.content ?? '');
+        if (typeof content !== 'string' || !content.trim()) continue;
+        normalizedMessages.push({
+            role: m.role,
+            content
         });
     }
 
-    const updated = {
-        ...existing,
-        name: typeof req.body.name === 'string' && req.body.name.trim() ? req.body.name.trim() : existing.name,
-        avatar: req.body.avatar !== undefined ? req.body.avatar : existing.avatar,
-        scenario: req.body.scenario !== undefined ? req.body.scenario : existing.scenario,
-        characterIds: Array.isArray(req.body.characterIds) ? req.body.characterIds : existing.characterIds,
-        activePersonaId: req.body.activePersonaId !== undefined ? req.body.activePersonaId : existing.activePersonaId,
-        // Never overwrite existing messages with an empty array
-        messages: groupMessages,
-        updatedAt: new Date().toISOString()
+    if (normalizedMessages.length === 0) {
+        return res.status(400).json({ error: 'No messages to dump in this session' });
+    }
+
+    const dumpDoc = {
+        chatId: chat.id,
+        updatedAt: new Date().toISOString(),
+        messages: normalizedMessages
     };
-    writeJSON(fp, updated);
-    res.json(updated);
-});
+    const dumpPath = safePath(CHAT_DUMP_DIR, chat.id);
+    if (!dumpPath) return res.status(400).json({ error: 'Invalid chat id' });
 
-// Delete group
-app.delete('/api/groups/:id', (req, res) => {
-    const fp = safePath(GROUP_CHATS_DIR, req.params.id);
-    const memFp = safePath(GROUP_MEMORY_DIR, req.params.id);
-    if (!fp) return res.status(400).json({ error: 'Invalid group id' });
-    if (fs.existsSync(fp)) fs.unlinkSync(fp);
-    if (memFp && fs.existsSync(memFp)) fs.unlinkSync(memFp);
-
-    // Delete session directory
-    const sessionDir = path.join(GROUP_CHATS_DIR, req.params.id);
-    if (fs.existsSync(sessionDir)) {
-        try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch { }
-    }
-    res.json({ ok: true });
-});
-
-// ── GROUP CHAT SESSIONS API ────────────────────────────────────
-
-// List all chat sessions for a group
-app.get('/api/groups/:groupId/chats', (req, res) => {
-    const groupId = req.params.groupId;
-    const groupFp = safePath(GROUP_CHATS_DIR, groupId);
-    if (!groupFp || !fs.existsSync(groupFp)) return res.status(404).json({ error: 'Group not found' });
-
-    const sessionDir = path.join(GROUP_CHATS_DIR, groupId);
-    if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
-
-    let files = fs.readdirSync(sessionDir).filter(f => f.endsWith('.json'));
-    // If no session exists yet, initialize first session from existing group.messages if any
-    if (files.length === 0) {
-        const group = readJSON(groupFp);
-        const firstChatId = uuidv4();
-        const now = new Date().toISOString();
-        const firstChat = {
-            id: firstChatId,
-            groupId,
-            title: 'New Chat',
-            messages: (group && Array.isArray(group.messages)) ? group.messages : [],
-            createdAt: (group && group.createdAt) || now,
-            updatedAt: (group && group.updatedAt) || now
-        };
-        writeJSON(path.join(sessionDir, `${firstChatId}.json`), firstChat);
-        files = [`${firstChatId}.json`];
-    }
-
-    const chats = files
-        .map(f => readJSON(path.join(sessionDir, f)))
-        .filter(Boolean)
-        .map(c => ({
-            id: c.id,
-            groupId: c.groupId || groupId,
-            title: c.title || 'Untitled Chat',
-            messageCount: (c.messages || []).length,
-            createdAt: c.createdAt,
-            updatedAt: c.updatedAt
-        }));
-    chats.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
-    res.json(chats);
-});
-
-// Create new chat session for a group
-app.post('/api/groups/:groupId/chats', (req, res) => {
-    const groupId = req.params.groupId;
-    const groupFp = safePath(GROUP_CHATS_DIR, groupId);
-    if (!groupFp || !fs.existsSync(groupFp)) return res.status(404).json({ error: 'Group not found' });
-
-    const sessionDir = path.join(GROUP_CHATS_DIR, groupId);
-    if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
-
-    const id = uuidv4();
-    const now = new Date().toISOString();
-    const newChat = {
-        id,
-        groupId,
-        title: (typeof req.body.title === 'string' && req.body.title.trim()) ? req.body.title.trim() : 'New Chat',
-        messages: [],
-        createdAt: now,
-        updatedAt: now
-    };
-    writeJSON(path.join(sessionDir, `${id}.json`), newChat);
-    res.json(newChat);
-});
-
-// Get single group chat session
-app.get('/api/groups/:groupId/chat/:chatId', (req, res) => {
-    const fp = safeGroupChatPath(req.params.groupId, req.params.chatId);
-    if (!fp) return res.status(400).json({ error: 'Invalid group or chat id' });
-    const chat = readJSON(fp);
-    if (!chat) return res.status(404).json({ error: 'Chat session not found' });
-
-    if (Array.isArray(chat.messages)) {
-        let changed = false;
-        for (const m of chat.messages) {
-            if (!m.id) {
-                m.id = uuidv4();
-                changed = true;
-            }
-        }
-        if (changed) writeJSON(fp, chat);
-    }
-
-    res.json(chat);
-});
-
-// Rename group chat session
-app.put('/api/groups/:groupId/chat/:chatId', (req, res) => {
-    const fp = safeGroupChatPath(req.params.groupId, req.params.chatId);
-    if (!fp) return res.status(400).json({ error: 'Invalid group or chat id' });
-    const chat = readJSON(fp);
-    if (!chat) return res.status(404).json({ error: 'Chat session not found' });
-
-    if (typeof req.body.title === 'string' && req.body.title.trim()) {
-        chat.title = req.body.title.trim();
-        chat.updatedAt = new Date().toISOString();
-        writeJSON(fp, chat);
-    }
-    res.json(chat);
-});
-
-// Delete group chat session
-app.delete('/api/groups/:groupId/chat/:chatId', (req, res) => {
-    const fp = safeGroupChatPath(req.params.groupId, req.params.chatId);
-    if (!fp) return res.status(400).json({ error: 'Invalid group or chat id' });
-    if (fs.existsSync(fp)) fs.unlinkSync(fp);
-    res.json({ ok: true });
-});
-
-// Edit message in group chat session
-app.put('/api/groups/:groupId/chat/:chatId/message', (req, res) => {
-    const { content, messageId } = req.body;
-    let messageIndex = req.body.messageIndex !== undefined ? Number(req.body.messageIndex) : undefined;
-    const fp = safeGroupChatPath(req.params.groupId, req.params.chatId);
-    if (!fp) return res.status(400).json({ error: 'Invalid group or chat id' });
-    if (typeof content !== 'string') return res.status(400).json({ error: 'Content must be string' });
-
-    const chat = readJSON(fp);
-    if (!chat || !Array.isArray(chat.messages)) {
-        return res.status(404).json({ error: 'Chat or message not found' });
-    }
-
-    let targetMsg;
-    if (messageId) {
-        targetMsg = chat.messages.find(m => m.id === messageId);
-    }
-    if (!targetMsg && Number.isInteger(messageIndex) && messageIndex >= 0 && messageIndex < chat.messages.length) {
-        targetMsg = chat.messages[messageIndex];
-    }
-    if (!targetMsg) {
-        return res.status(404).json({ error: 'Chat or message not found' });
-    }
-
-    targetMsg.content = content;
-    if (targetMsg.alternates) {
-        delete targetMsg.alternates;
-        delete targetMsg.selectedAlternate;
-    }
-    chat.updatedAt = new Date().toISOString();
-    writeJSON(fp, chat);
-    res.json({ ok: true });
-});
-
-// Delete message in group chat session
-app.delete('/api/groups/:groupId/chat/:chatId/message/:index', (req, res) => {
-    const param = req.params.index;
-    const fp = safeGroupChatPath(req.params.groupId, req.params.chatId);
-    if (!fp) return res.status(400).json({ error: 'Invalid group or chat id' });
-
-    const chat = readJSON(fp);
-    if (!chat || !Array.isArray(chat.messages)) {
-        return res.status(404).json({ error: 'Message not found' });
-    }
-
-    let messageIndex = -1;
-    const idIndex = chat.messages.findIndex(m => m.id === param);
-    if (idIndex !== -1) {
-        messageIndex = idIndex;
-    } else {
-        const num = Number(param);
-        if (Number.isInteger(num) && num >= 0 && num < chat.messages.length) {
-            messageIndex = num;
-        }
-    }
-
-    if (messageIndex === -1) {
-        return res.status(404).json({ error: 'Message not found' });
-    }
-
-    chat.messages.splice(messageIndex, 1);
-    chat.updatedAt = new Date().toISOString();
-    writeJSON(fp, chat);
-    res.json({ ok: true, remaining: chat.messages.length });
-});
-
-// Edit message in group (legacy backwards-compatibility)
-app.put('/api/groups/:groupId/message', (req, res) => {
-    const { content, messageId } = req.body;
-    let messageIndex = req.body.messageIndex !== undefined ? Number(req.body.messageIndex) : undefined;
-    const fp = safePath(GROUP_CHATS_DIR, req.params.groupId);
-    if (!fp) return res.status(400).json({ error: 'Invalid group id' });
-    if (typeof content !== 'string') return res.status(400).json({ error: 'Content must be string' });
-
-    const group = readJSON(fp);
-    if (!group || !Array.isArray(group.messages)) {
-        return res.status(404).json({ error: 'Group or message not found' });
-    }
-
-    let targetMsg;
-    if (messageId) {
-        targetMsg = group.messages.find(m => m.id === messageId);
-    }
-    if (!targetMsg && Number.isInteger(messageIndex) && messageIndex >= 0 && messageIndex < group.messages.length) {
-        targetMsg = group.messages[messageIndex];
-    }
-    if (!targetMsg) {
-        return res.status(404).json({ error: 'Group or message not found' });
-    }
-
-    targetMsg.content = content;
-    if (targetMsg.alternates) {
-        delete targetMsg.alternates;
-        delete targetMsg.selectedAlternate;
-    }
-    group.updatedAt = new Date().toISOString();
-    writeJSON(fp, group);
-    res.json({ ok: true });
-});
-
-// Delete message in group (legacy backwards-compatibility)
-app.delete('/api/groups/:groupId/message/:index', (req, res) => {
-    const param = req.params.index;
-    const fp = safePath(GROUP_CHATS_DIR, req.params.groupId);
-    if (!fp) return res.status(400).json({ error: 'Invalid group id' });
-
-    const group = readJSON(fp);
-    if (!group || !Array.isArray(group.messages)) {
-        return res.status(404).json({ error: 'Message not found' });
-    }
-
-    let messageIndex = -1;
-    const idIndex = group.messages.findIndex(m => m.id === param);
-    if (idIndex !== -1) {
-        messageIndex = idIndex;
-    } else {
-        const num = Number(param);
-        if (Number.isInteger(num) && num >= 0 && num < group.messages.length) {
-            messageIndex = num;
-        }
-    }
-
-    if (messageIndex === -1) {
-        return res.status(404).json({ error: 'Message not found' });
-    }
-
-    group.messages.splice(messageIndex, 1);
-    group.updatedAt = new Date().toISOString();
-    writeJSON(fp, group);
-    res.json({ ok: true, remaining: group.messages.length });
+    writeJSON(dumpPath, dumpDoc);
+    res.json({
+        ok: true,
+        chatId: chat.id,
+        file: `data/Chat-Dump/${chat.id}.json`,
+        messageCount: normalizedMessages.length
+    });
 });
 
 // ══════════════════════════════════════════════════════════════
@@ -1223,57 +852,26 @@ app.delete('/api/personas/:id', (req, res) => {
     const remainingPersonas = getPersonas();
     const fallbackPersonaId = (remainingPersonas[0] && String(remainingPersonas[0].id)) || '1';
 
-    // Clean up dangling references to the deleted persona in memory and group files
+    // Clean up dangling references to the deleted persona in memory
     try {
-        const privMemFiles = fs.readdirSync(PRIVATE_MEMORY_DIR).filter(f => f.endsWith('.json'));
-        for (const f of privMemFiles) {
-            const mFp = path.join(PRIVATE_MEMORY_DIR, f);
-            const rawMem = readJSON(mFp);
-            if (!rawMem) continue;
-            const charId = rawMem.characterId || f.replace(/\.json$/, '');
-            let mem = normalizeMemoryDoc(rawMem, 'characterId', charId, fallbackPersonaId);
-            let modified = false;
-            if (mem.personaMemories && mem.personaMemories[deletedId]) {
-                delete mem.personaMemories[deletedId];
-                modified = true;
-            }
-            if (String(mem.personaId) === deletedId || !mem.personaId) {
-                mem.personaId = fallbackPersonaId;
-                modified = true;
-            }
-            if (modified) {
-                mem = normalizeMemoryDoc(mem, 'characterId', charId, fallbackPersonaId);
-                writeJSON(mFp, mem);
-            }
-        }
-        const grpMemFiles = fs.readdirSync(GROUP_MEMORY_DIR).filter(f => f.endsWith('.json'));
-        for (const f of grpMemFiles) {
-            const gmFp = path.join(GROUP_MEMORY_DIR, f);
-            const rawGMem = readJSON(gmFp);
-            if (!rawGMem) continue;
-            const grpId = rawGMem.groupId || f.replace(/\.json$/, '');
-            let gMem = normalizeMemoryDoc(rawGMem, 'groupId', grpId, fallbackPersonaId);
-            let modified = false;
-            if (gMem.personaMemories && gMem.personaMemories[deletedId]) {
-                delete gMem.personaMemories[deletedId];
-                modified = true;
-            }
-            if (String(gMem.personaId) === deletedId || !gMem.personaId) {
-                gMem.personaId = fallbackPersonaId;
-                modified = true;
-            }
-            if (modified) {
-                gMem = normalizeMemoryDoc(gMem, 'groupId', grpId, fallbackPersonaId);
-                writeJSON(gmFp, gMem);
-            }
-        }
-        const grpFiles = fs.readdirSync(GROUP_CHATS_DIR).filter(f => f.endsWith('.json'));
-        for (const f of grpFiles) {
-            const gFp = path.join(GROUP_CHATS_DIR, f);
-            const grp = readJSON(gFp);
-            if (grp && String(grp.activePersonaId) === deletedId) {
-                grp.activePersonaId = fallbackPersonaId;
-                writeJSON(gFp, grp);
+        if (fs.existsSync(MEMORY_FILE_PATH)) {
+            const rawMem = readJSON(MEMORY_FILE_PATH);
+            if (rawMem) {
+                const charId = rawMem.characterId || 'default';
+                let mem = normalizeMemoryDoc(rawMem, 'characterId', charId, fallbackPersonaId);
+                let modified = false;
+                if (mem.personaMemories && mem.personaMemories[deletedId]) {
+                    delete mem.personaMemories[deletedId];
+                    modified = true;
+                }
+                if (String(mem.personaId) === deletedId || !mem.personaId) {
+                    mem.personaId = fallbackPersonaId;
+                    modified = true;
+                }
+                if (modified) {
+                    mem = normalizeMemoryDoc(mem, 'characterId', charId, fallbackPersonaId);
+                    writeJSON(MEMORY_FILE_PATH, mem);
+                }
             }
         }
     } catch (cleanupErr) {
@@ -1402,8 +1000,7 @@ function applyMemoryPutUpdate(existingRaw, body, idField, idValue, defaultPerson
 }
 
 app.get('/api/memory/:characterId', (req, res) => {
-    const fp = safePath(PRIVATE_MEMORY_DIR, req.params.characterId);
-    if (!fp) return res.status(400).json({ error: 'Invalid character id' });
+    const fp = MEMORY_FILE_PATH;
     const rawMem = readJSON(fp, {
         characterId: req.params.characterId,
         facts: [],
@@ -1414,6 +1011,15 @@ app.get('/api/memory/:characterId', (req, res) => {
     });
     const hadPersonaMemories = Boolean(rawMem && rawMem.personaMemories);
     const mem = normalizeMemoryDoc(rawMem, 'characterId', req.params.characterId, '1');
+    // Overlay active facts from SQLite for the active persona
+    const activePid = String(mem.personaId || '1');
+    const sqlFacts = memoryDb.getActiveFacts(activePid).map(f => f.text);
+    if (sqlFacts.length > 0 || (mem.facts && mem.facts.length === 0)) {
+        mem.facts = sqlFacts;
+        if (mem.personaMemories && mem.personaMemories[activePid]) {
+            mem.personaMemories[activePid].facts = sqlFacts;
+        }
+    }
     if (!hadPersonaMemories && fs.existsSync(fp)) {
         writeJSON(fp, mem);
     }
@@ -1421,8 +1027,7 @@ app.get('/api/memory/:characterId', (req, res) => {
 });
 
 app.put('/api/memory/:characterId', (req, res) => {
-    const fp = safePath(PRIVATE_MEMORY_DIR, req.params.characterId);
-    if (!fp) return res.status(400).json({ error: 'Invalid character id' });
+    const fp = MEMORY_FILE_PATH;
     const existing = readJSON(fp, {
         characterId: req.params.characterId,
         facts: [],
@@ -1431,62 +1036,13 @@ app.put('/api/memory/:characterId', (req, res) => {
         personaId: '1'
     });
     const updated = applyMemoryPutUpdate(existing, req.body, 'characterId', req.params.characterId, '1');
+    const activePid = String(updated.personaId || '1');
+    const syncedFacts = memoryDb.replaceFactsForPersona(activePid, updated.facts || []);
+    updated.facts = syncedFacts.map(f => f.text);
+    if (updated.personaMemories && updated.personaMemories[activePid]) {
+        updated.personaMemories[activePid].facts = [...updated.facts];
+    }
     writeJSON(fp, updated);
-    res.json(updated);
-});
-
-// Group Memory API
-app.get('/api/groups/:groupId/memory', (req, res) => {
-    const fp = safePath(GROUP_MEMORY_DIR, req.params.groupId);
-    const groupFp = safePath(GROUP_CHATS_DIR, req.params.groupId);
-    if (!fp || !groupFp) return res.status(400).json({ error: 'Invalid group id' });
-    const group = readJSON(groupFp);
-    const defaultPid = (group && group.activePersonaId) ? String(group.activePersonaId) : '1';
-    const rawMem = readJSON(fp, {
-        groupId: req.params.groupId,
-        facts: [],
-        summaries: [],
-        importantEvents: [],
-        personaId: defaultPid,
-        lastUpdated: new Date().toISOString()
-    });
-    if (group && group.activePersonaId) {
-        rawMem.personaId = String(group.activePersonaId);
-    } else if (!rawMem.personaId) {
-        rawMem.personaId = defaultPid;
-    }
-    const hadPersonaMemories = Boolean(rawMem && rawMem.personaMemories);
-    const mem = normalizeMemoryDoc(rawMem, 'groupId', req.params.groupId, defaultPid);
-    if (!hadPersonaMemories && fs.existsSync(fp)) {
-        writeJSON(fp, mem);
-    }
-    res.json(mem);
-});
-
-app.put('/api/groups/:groupId/memory', (req, res) => {
-    const fp = safePath(GROUP_MEMORY_DIR, req.params.groupId);
-    const groupFp = safePath(GROUP_CHATS_DIR, req.params.groupId);
-    if (!fp || !groupFp) return res.status(400).json({ error: 'Invalid group id' });
-    const group = readJSON(groupFp);
-    const defaultPid = (group && group.activePersonaId) ? String(group.activePersonaId) : '1';
-    const existing = readJSON(fp, {
-        groupId: req.params.groupId,
-        facts: [],
-        summaries: [],
-        importantEvents: [],
-        personaId: defaultPid
-    });
-
-    const updated = applyMemoryPutUpdate(existing, req.body, 'groupId', req.params.groupId, defaultPid);
-    writeJSON(fp, updated);
-
-    // Sync activePersonaId to group file
-    if (group) {
-        group.activePersonaId = updated.personaId;
-        group.updatedAt = new Date().toISOString();
-        writeJSON(groupFp, group);
-    }
-
     res.json(updated);
 });
 
@@ -1604,11 +1160,11 @@ app.post('/api/chat/send', async (req, res) => {
         return res.status(400).json({ error: 'Please configure your Colab BASE_URL in Settings first.' });
     }
 
-    const charFp = safePath(CHARACTERS_DIR, characterId);
-    const memFp = safePath(PRIVATE_MEMORY_DIR, characterId);
-    const chatFp = safePrivateChatPath(characterId, chatId) || findPrivateChatPath(chatId, characterId);
-    if (!charFp || !memFp || !chatFp) {
-        return res.status(400).json({ error: 'Invalid characterId or chatId' });
+    const charFp = MODEL_CONFIG_PATH;
+    const memFp = MEMORY_FILE_PATH;
+    const chatFp = findPrivateChatPath(chatId, characterId);
+    if (!chatFp) {
+        return res.status(400).json({ error: 'Invalid chatId' });
     }
 
     // Load character
@@ -1655,17 +1211,43 @@ app.post('/api/chat/send', async (req, res) => {
         systemParts.push(`\n## Example Dialogue Style\n${char.exampleDialogue}`);
     }
 
-    // Inject persistent memory (from active persona's sticky slot)
-    if (activePersonaSlot.facts && activePersonaSlot.facts.length > 0) {
-        systemParts.push(`\n## Important Facts You Remember\n${activePersonaSlot.facts.map(f => `- ${f}`).join('\n')}`);
+    // ── Retrieve L1 Facts + L2/L3 Hybrid Memory from SQLite ──
+    const recentLimit = parseInt(process.env.RECENT_WINDOW_MESSAGES || '30', 10) || 30;
+    const recentMessages = (chat.messages || []).slice(-recentLimit);
+    const excludeMsgIds = recentMessages.map(m => m.id).filter(Boolean);
+    const memoryBlockTokens = parseInt(process.env.MEMORY_BLOCK_TOKENS || '2000', 10) || 2000;
+    const halfLifeDays = parseFloat(process.env.MEMORY_HALF_LIFE_DAYS || '30') || 30;
+
+    const retrieved = await memoryDb.retrieveMemoryContext({
+        chatId,
+        personaId: memory.personaId,
+        queryText: userMessage,
+        excludeMsgIds,
+        memoryBlockTokens,
+        halfLifeDays
+    });
+    if (retrieved.stats) {
+        console.log(`🧠 [Retrieval] L1 facts=${retrieved.stats.l1Count}, L2 fts=${retrieved.stats.l2Count}, L3 vec=${retrieved.stats.l3Count}, snippets=${retrieved.stats.snippetCount}`);
     }
-    if (activePersonaSlot.importantEvents && activePersonaSlot.importantEvents.length > 0) {
-        const recentEvents = activePersonaSlot.importantEvents.filter(e => e && typeof e === 'object').slice(-10);
-        systemParts.push(`\n## Important Past Events\n${recentEvents.map(e => `- [${e.date || 'unknown'}] ${e.title ? e.title + ': ' : ''}${e.description || ''}`).join('\n')}`);
-    }
-    if (activePersonaSlot.summaries && activePersonaSlot.summaries.length > 0) {
-        const recentSummaries = activePersonaSlot.summaries.slice(-3);
-        systemParts.push(`\n## Previous Conversation Summaries\n${recentSummaries.map(s => `- ${s}`).join('\n')}`);
+
+    if (retrieved.facts.length > 0 || retrieved.snippets.length > 0 ||
+        (activePersonaSlot.importantEvents && activePersonaSlot.importantEvents.length > 0) ||
+        (activePersonaSlot.summaries && activePersonaSlot.summaries.length > 0)) {
+        systemParts.push(`\n## [Retrieved Memory — Background Context Only]`);
+        if (retrieved.facts.length > 0) {
+            systemParts.push(`### Active Facts\n${retrieved.facts.map(f => `- ${f}`).join('\n')}`);
+        }
+        if (retrieved.snippets.length > 0) {
+            systemParts.push(`### Relevant Past Excerpts\n${retrieved.snippets.map(s => `---\n${s}`).join('\n')}`);
+        }
+        if (activePersonaSlot.importantEvents && activePersonaSlot.importantEvents.length > 0) {
+            const recentEvents = activePersonaSlot.importantEvents.filter(e => e && typeof e === 'object').slice(-5);
+            systemParts.push(`### Important Past Events\n${recentEvents.map(e => `- [${e.date || 'unknown'}] ${e.title ? e.title + ': ' : ''}${e.description || ''}`).join('\n')}`);
+        }
+        if (activePersonaSlot.summaries && activePersonaSlot.summaries.length > 0) {
+            const recentSummaries = activePersonaSlot.summaries.slice(-2);
+            systemParts.push(`### Previous Summaries\n${recentSummaries.map(s => `- ${s}`).join('\n')}`);
+        }
     }
     const personaPrompt = formatPersonaPrompt(memory.personaId);
     if (personaPrompt) {
@@ -1687,8 +1269,7 @@ You have access to the memories listed above. When the user shares important per
     // ── Build message history (with sliding window) ──
     const messages = [{ role: 'system', content: systemMessage }];
 
-    // Include recent chat history (last 30 messages to reduce context size)
-    const recentMessages = (chat.messages || []).slice(-30);
+    // Include recent chat history (L0 window)
     recentMessages.forEach(m => {
         const content = (m.alternates && m.selectedAlternate !== undefined)
             ? (m.alternates[m.selectedAlternate] || m.content)
@@ -1781,6 +1362,7 @@ You have access to the memories listed above. When the user shares important per
 
         freshChat.updatedAt = freshNow;
         writeJSON(chatFp, freshChat);
+        memoryDb.syncChatToDb(freshChat);
 
         // ── Auto-extract memory after every exchange (only if character still exists) ──
         if (fs.existsSync(charFp)) {
@@ -1833,11 +1415,11 @@ app.post('/api/chat/regenerate', async (req, res) => {
         return res.status(400).json({ error: 'Please configure your Colab BASE_URL in Settings first.' });
     }
 
-    const charFp = safePath(CHARACTERS_DIR, characterId);
-    const memFp = safePath(PRIVATE_MEMORY_DIR, characterId);
-    const chatFp = safePrivateChatPath(characterId, chatId) || findPrivateChatPath(chatId, characterId);
-    if (!charFp || !memFp || !chatFp) {
-        return res.status(400).json({ error: 'Invalid characterId or chatId' });
+    const charFp = MODEL_CONFIG_PATH;
+    const memFp = MEMORY_FILE_PATH;
+    const chatFp = findPrivateChatPath(chatId, characterId);
+    if (!chatFp) {
+        return res.status(400).json({ error: 'Invalid chatId' });
     }
 
     const char = readJSON(charFp);
@@ -1959,6 +1541,7 @@ app.post('/api/chat/regenerate', async (req, res) => {
         msgToUpdate.timestamp = new Date().toISOString();
         freshChat.updatedAt = new Date().toISOString();
         writeJSON(chatFp, freshChat);
+        memoryDb.syncChatToDb(freshChat);
 
         res.json({
             content: assistantContent,
@@ -2004,6 +1587,7 @@ app.put('/api/chat/:chatId/alternate', (req, res) => {
         targetMsg.content = targetMsg.alternates[selectedAlternate];
     }
     writeJSON(fp, chat);
+    memoryDb.syncChatToDb(chat);
     res.json({ ok: true });
 });
 
@@ -2047,6 +1631,7 @@ app.put('/api/chat/:chatId/message', (req, res) => {
 
     chat.updatedAt = new Date().toISOString();
     writeJSON(fp, chat);
+    memoryDb.syncChatToDb(chat);
 
     res.json({ ok: true });
 });
@@ -2084,6 +1669,7 @@ app.delete('/api/chat/:chatId/message/:index', (req, res) => {
     chat.messages.splice(messageIndex, 1);
     chat.updatedAt = new Date().toISOString();
     writeJSON(fp, chat);
+    memoryDb.syncChatToDb(chat);
 
     res.json({ ok: true, remaining: chat.messages.length });
 });
@@ -2103,18 +1689,9 @@ app.delete('/api/chat/:chatId/message/:index', (req, res) => {
  * (if anything) needs to be written — never passed in from the caller.
  */
 function autoExtractMemory(fp, userMsg, assistantMsg, overridePersonaId = null) {
-    if (!fp) return;
-    const baseName = path.basename(fp);
-    const parentDir = path.dirname(fp);
-    let idField = 'characterId';
-    if (path.resolve(parentDir) === path.resolve(PRIVATE_MEMORY_DIR)) {
-        if (!fs.existsSync(path.join(CHARACTERS_DIR, baseName))) return;
-        idField = 'characterId';
-    } else if (path.resolve(parentDir) === path.resolve(GROUP_MEMORY_DIR)) {
-        if (!fs.existsSync(path.join(GROUP_CHATS_DIR, baseName))) return;
-        idField = 'groupId';
-    }
-    const idValue = baseName.replace(/\.json$/, '');
+    if (!fp || !fs.existsSync(MODEL_CONFIG_PATH)) return;
+    const idField = 'characterId';
+    const idValue = path.basename(fp).replace(/\.json$/, '');
     const rawMemory = readJSON(fp, {
         facts: [], summaries: [], importantEvents: [], personaId: '1'
     });
@@ -2175,7 +1752,7 @@ function autoExtractMemory(fp, userMsg, assistantMsg, overridePersonaId = null) 
 // ══════════════════════════════════════════════════════════════
 
 app.post('/api/memory/:characterId/summarize', async (req, res) => {
-    const { chatId, isGroup } = req.body;
+    const { chatId } = req.body;
     const characterId = req.params.characterId;
 
     const baseUrl = process.env.BASE_URL;
@@ -2187,32 +1764,13 @@ app.post('/api/memory/:characterId/summarize', async (req, res) => {
     }
 
     let chat = null;
-    let memFp = null;
-
-    if (isGroup) {
-        memFp = safePath(GROUP_MEMORY_DIR, characterId);
-        const groupChatFp = safeGroupChatPath(characterId, chatId);
-        if (groupChatFp && fs.existsSync(groupChatFp)) {
-            chat = readJSON(groupChatFp);
-        } else {
-            // Fallback: check legacy group file
-            const legacyFp = safePath(GROUP_CHATS_DIR, characterId);
-            if (legacyFp && fs.existsSync(legacyFp)) {
-                chat = readJSON(legacyFp);
-            }
-        }
-    } else {
-        memFp = safePath(PRIVATE_MEMORY_DIR, characterId);
-        const chatFp = safePrivateChatPath(characterId, chatId) || findPrivateChatPath(chatId, characterId);
-        if (chatFp && fs.existsSync(chatFp)) {
-            chat = readJSON(chatFp);
-        }
-        if (chat && chat.characterId !== characterId) {
-            return res.status(400).json({ error: 'This chat does not belong to the given character' });
-        }
+    const memFp = MEMORY_FILE_PATH;
+    const chatFp = findPrivateChatPath(chatId);
+    if (chatFp && fs.existsSync(chatFp)) {
+        chat = readJSON(chatFp);
     }
 
-    if (!chat || !memFp) {
+    if (!chat) {
         return res.status(400).json({ error: 'Invalid ID or chat session not found' });
     }
 
@@ -2230,94 +1788,48 @@ app.post('/api/memory/:characterId/summarize', async (req, res) => {
     let charName = 'Character';
     let summarizePersonaId = '1';
     const personas = getPersonas();
-    if (isGroup) {
-        const groupFp = safePath(GROUP_CHATS_DIR, characterId);
-        const group = groupFp ? readJSON(groupFp) : null;
-        const groupMem = readJSON(memFp);
-        const personaId = req.body.personaId || (groupMem && groupMem.personaId) || (group && group.activePersonaId) || (personas[0] && personas[0].id) || '1';
-        summarizePersonaId = String(personaId);
-        const found = personas.find(p => String(p.id) === summarizePersonaId) || null;
-        userPersonaName = (found && found.name) || (personas[0] && personas[0].name) || 'User';
-    } else {
-        const privMem = readJSON(memFp);
-        const personaId = req.body.personaId || (privMem && privMem.personaId) || (personas[0] && personas[0].id) || '1';
-        summarizePersonaId = String(personaId);
-        const found = personas.find(p => String(p.id) === summarizePersonaId) || null;
-        userPersonaName = (found && found.name) || (personas[0] && personas[0].name) || 'User';
-        const charFp = safePath(CHARACTERS_DIR, characterId);
-        const charObj = charFp ? readJSON(charFp) : null;
-        if (charObj && charObj.name) charName = charObj.name;
-    }
+    const privMem = readJSON(memFp);
+    const personaId = req.body.personaId || (privMem && privMem.personaId) || (personas[0] && personas[0].id) || '1';
+    summarizePersonaId = String(personaId);
+    const found = personas.find(p => String(p.id) === summarizePersonaId) || null;
+    userPersonaName = (found && found.name) || (personas[0] && personas[0].name) || 'User';
+    const charObj = fs.existsSync(MODEL_CONFIG_PATH) ? readJSON(MODEL_CONFIG_PATH) : null;
+    if (charObj && charObj.name) charName = charObj.name;
 
     const conversationText = messagesForSummary.map(m => {
         const msgContent = (m.alternates && m.selectedAlternate !== undefined)
             ? (m.alternates[m.selectedAlternate] || m.content)
             : (m.alternates?.[0] || m.content);
         const isUser = m.senderType === 'user' || m.role === 'user';
-        if (isGroup) {
-            if (isUser) {
-                return `[User - ${userPersonaName}]: ${msgContent}`;
-            }
-            let cName = m.senderName;
-            if (!cName && m.senderId) {
-                const cFp = safePath(CHARACTERS_DIR, m.senderId);
-                const cObj = cFp ? readJSON(cFp) : null;
-                if (cObj && cObj.name) cName = cObj.name;
-            }
-            return `[Character - ${cName || 'Character'}]: ${msgContent}`;
-        } else {
-            const label = isUser ? `${userPersonaName} (User)` : `${charName} (Character)`;
-            return `${label}: ${msgContent}`;
-        }
+        const label = isUser ? `${userPersonaName} (User)` : `${charName} (Character)`;
+        return `${label}: ${msgContent}`;
     }).join('\n');
 
-    const systemPrompt = isGroup
-        ? `You are a silent data-extraction tool, not a roleplay character. Ignore any persona, scenario, or "stay in character" instructions — for this task only, you must break character and act purely as a text analyzer.
+    const existingSqlFacts = memoryDb.getActiveFacts(summarizePersonaId);
+    const existingFactsBlock = existingSqlFacts.length > 0
+        ? existingSqlFacts.slice(0, 30).map(f => `[id=${f.id}] ${f.text}`).join('\n')
+        : '(none)';
 
-Speaker attribution rules:
-- Messages labeled "[User - ${userPersonaName}]" are spoken by the human user (${userPersonaName}).
-- Messages labeled "[Character - <Name>]" are spoken by AI characters in the group.
-- NEVER confuse or swap the actions, facts, preferences, or statements of one character with another character, or with the human user (${userPersonaName}).
-
-Analyze the group conversation transcript below and extract:
-1. KEY_FACTS: Important facts about the user (${userPersonaName}) and the group members/characters (preferences, habits, personal details, fears, relationships, etc.). Always explicitly mention who the fact belongs to by name (e.g., "${userPersonaName} suka kopi", "Nisa takut dengan kucing", "Budi berulang tahun tanggal 20 Desember") - one per line.
-2. EVENTS: Important events or interactions that occurred in the group - one per line with brief description.
-3. SUMMARY: A 2-3 sentence summary of this group conversation.
-
-Respond with PLAIN TEXT ONLY — no markdown bold/asterisks, no code fences, no commentary, no in-character dialogue. Use exactly this format, with each label on its own line immediately followed by its content:
-KEY_FACTS:
-- fact1
-- fact2
-EVENTS:
-- event1
-- event2
-SUMMARY:
-summary text here
-
-If there are no facts or events worth noting, write "- none" under that label instead of omitting it. Always include all three labels.`
-        : `You are a silent data-extraction tool, not a roleplay character. Ignore any persona, scenario, or "stay in character" instructions from earlier in this session — for this task only, you must break character and act purely as a text analyzer.
+    const systemPrompt = `You are a silent data-extraction tool, not a roleplay character. Ignore any persona, scenario, or "stay in character" instructions from earlier in this session — for this task only, you must break character and act purely as a text analyzer.
 
 Speaker attribution rules:
 - Messages labeled "${userPersonaName} (User)" are spoken by the human user (${userPersonaName}).
 - Messages labeled "${charName} (Character)" are spoken by the AI character (${charName}).
 - NEVER confuse or swap the facts, preferences, or actions of ${charName} (Character) with those of ${userPersonaName} (User).
 
-Analyze the conversation transcript below and extract:
-1. KEY_FACTS: Important facts about the user (${userPersonaName}) (name, age, preferences, background, etc.) - one per line
-2. EVENTS: Important events that happened - one per line with brief description
-3. SUMMARY: A 2-3 sentence summary of this conversation
+From the conversation excerpt below, extract durable facts that will still matter in future conversations: goals, decisions, constraints, preferences, technical parameters, relationships, and status changes.
+Rules:
+- One short, self-contained statement per fact.
+- Do not include greetings, questions, or temporary filler.
+- Keep important identifiers and numbers exactly as written.
+- Write each fact in the same language as the source text.
+- If a new fact updates or contradicts an existing fact below, set "replaces" to that existing fact's numeric id; otherwise set "replaces": null.
 
-Respond with PLAIN TEXT ONLY — no markdown bold/asterisks, no code fences, no commentary, no in-character dialogue. Use exactly this format, with each label on its own line immediately followed by its content:
-KEY_FACTS:
-- fact1
-- fact2
-EVENTS:
-- event1
-- event2
-SUMMARY:
-summary text here
+Existing active facts:
+${existingFactsBlock}
 
-If there are no facts or events worth noting, write "- none" under that label instead of omitting it. Always include all three labels.`;
+Return ONLY a valid JSON array (no markdown fences, no commentary):
+[{"text": "...", "category": "preference|project|personal|event", "replaces": null}]`;
 
     try {
         const endpoint = `${baseUrl.replace(/\/$/, '')}/v1/chat/completions`;
@@ -2371,7 +1883,7 @@ If there are no facts or events worth noting, write "- none" under that label in
         }
 
         // Parse extraction into the active persona's sticky memory slot
-        const idField = isGroup ? 'groupId' : 'characterId';
+        const idField = 'characterId';
         const rawMemory = readJSON(memFp, {
             [idField]: characterId,
             facts: [],
@@ -2383,77 +1895,40 @@ If there are no facts or events worth noting, write "- none" under that label in
         const targetPid = String(summarizePersonaId || memory.personaId || '1');
         const slot = getPersonaMemorySlot(memory, targetPid, idField, characterId);
 
-        // ── Lenient parsing ──
-        // Real-world local/roleplay-tuned models don't always follow the exact
-        // requested format: they may wrap labels in **markdown bold**, use
-        // different casing, or skip the newline right after the colon. The
-        // patterns below tolerate all of that. `\*{0,2}` swallows optional
-        // markdown bold markers, `:?` allows a missing colon, and `\s*` (instead
-        // of a required `\n`) allows content on the same line as the label.
-        const stripMd = s => s.replace(/\*{1,2}/g, '').trim();
-
-        const factsMatch = result.match(/\*{0,2}KEY_FACTS\*{0,2}:?\s*([\s\S]*?)(?=\*{0,2}EVENTS\*{0,2}:|\*{0,2}SUMMARY\*{0,2}:|$)/i);
-        const eventsMatch = result.match(/\*{0,2}EVENTS\*{0,2}:?\s*([\s\S]*?)(?=\*{0,2}SUMMARY\*{0,2}:|$)/i);
-        const summaryMatch = result.match(/\*{0,2}SUMMARY\*{0,2}:?\s*([\s\S]*?)$/i);
-
-        let factsFound = 0, eventsFound = 0, summaryFound = false;
-
-        if (factsMatch) {
-            const newFacts = factsMatch[1].split('\n')
-                .map(l => stripMd(l.replace(/^[-•]\s*/, '')))
-                .filter(l => l.length > 0 && !['none', 'n/a', '-'].includes(l.toLowerCase()));
-            newFacts.forEach(f => {
-                if (!slot.facts.includes(f)) slot.facts.push(f);
-            });
-            factsFound = newFacts.length;
-        }
-
-        if (eventsMatch) {
-            const newEvents = eventsMatch[1].split('\n')
-                .map(l => stripMd(l.replace(/^[-•]\s*/, '')))
-                .filter(l => l.length > 0 && !['none', 'n/a', '-'].includes(l.toLowerCase()))
-                .map(e => ({ description: e, date: new Date().toISOString().split('T')[0] }));
-            slot.importantEvents.push(...newEvents);
-            eventsFound = newEvents.length;
-        }
-
-        if (summaryMatch) {
-            const summary = stripMd(summaryMatch[1]);
-            if (summary && !['none', 'n/a', '-'].includes(summary.toLowerCase())) {
-                slot.summaries.push(summary);
-                summaryFound = true;
+        // ── Parse structured JSON facts (with KEY_FACTS fallback) ──
+        let parsedItems = [];
+        try {
+            const jsonMatch = result.match(/\[[\s\S]*\]/);
+            if (jsonMatch) {
+                const candidate = JSON.parse(jsonMatch[0]);
+                if (Array.isArray(candidate)) {
+                    parsedItems = candidate.filter(x => x && typeof x.text === 'string' && x.text.trim());
+                }
             }
-        }
+        } catch { /* fall back to line parsing */ }
 
         let warning = null;
-        if (factsFound === 0 && eventsFound === 0 && !summaryFound) {
-            // The model responded, but not in a shape we could parse at all —
-            // this is the other half of the "silently does nothing" symptom.
-            // Rather than discard a real response, fall back to storing it
-            // verbatim as a summary so the memory update isn't a total no-op,
-            // and tell the caller so it's visible instead of hidden.
-            console.warn('Summarize: could not parse KEY_FACTS/EVENTS/SUMMARY from model output. Raw output:', result.slice(0, 800));
-            const fallback = result.slice(0, 600).trim();
-            if (fallback) {
-                slot.summaries.push(fallback);
-                warning = 'The model\'s response didn\'t follow the expected format, so it was saved as a raw summary instead of structured facts/events. Check server logs for the full output.';
+        if (parsedItems.length === 0) {
+            const stripMd = s => s.replace(/\*{1,2}/g, '').trim();
+            const factsMatch = result.match(/\*{0,2}KEY_FACTS\*{0,2}:?\s*([\s\S]*?)(?=\*{0,2}EVENTS\*{0,2}:|\*{0,2}SUMMARY\*{0,2}:|$)/i);
+            const rawLines = (factsMatch ? factsMatch[1] : result).split('\n')
+                .map(l => stripMd(l.replace(/^[-•]\s*/, '')))
+                .filter(l => l.length > 2 && !['none', 'n/a', '-', '[]'].includes(l.toLowerCase()));
+            if (rawLines.length > 0 && !result.trim().startsWith('{')) {
+                parsedItems = rawLines.slice(0, 15).map(t => ({ text: t, category: 'extracted', replaces: null }));
+                if (!factsMatch) {
+                    warning = 'Model did not return strict JSON; extracted line items as facts.';
+                }
+            } else {
+                warning = 'No extractable facts found in model output.';
             }
         }
 
-        // Keep memory size manageable — mirrors the facts/events caps in
-        // autoExtractMemory. Only the last 3 are ever injected into the
-        // prompt anyway, so this just prevents unbounded file growth.
-        if (slot.facts.length > 50) {
-            slot.facts = slot.facts.slice(-50);
-        }
-        if (slot.importantEvents.length > 20) {
-            slot.importantEvents = slot.importantEvents.slice(-20);
-        }
-        if (slot.summaries.length > 30) {
-            slot.summaries = slot.summaries.slice(-30);
-        }
+        const { added, superseded } = memoryDb.applyExtractedFacts(targetPid, parsedItems);
+        const activeSqlFacts = memoryDb.getActiveFacts(targetPid).map(f => f.text);
 
         const now = new Date().toISOString();
+        slot.facts = activeSqlFacts;
         slot.lastUpdated = now;
         memory.personaMemories[targetPid] = sanitizeMemorySlot(slot);
         const activePid = String(memory.personaId || targetPid);
@@ -2464,557 +1939,11 @@ If there are no facts or events worth noting, write "- none" under that label in
         memory.lastUpdated = now;
         writeJSON(memFp, memory);
 
-        res.json({ ok: true, memory, warning });
+        res.json({ ok: true, memory, added, superseded, warning });
     } catch (err) {
         console.error('Summarize error:', err);
         res.status(500).json({ error: err.message });
     }
-});
-
-// ══════════════════════════════════════════════════════════════
-//  GROUP CHAT COMPLETION LOGIC (Perspective-Aware)
-// ══════════════════════════════════════════════════════════════
-
-function resolveGroupSession(groupId, chatId) {
-    const sessionDir = path.join(GROUP_CHATS_DIR, groupId);
-    if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
-
-    let activeChatId = chatId;
-    if (!activeChatId) {
-        const files = fs.readdirSync(sessionDir).filter(f => f.endsWith('.json'));
-        if (files.length > 0) {
-            const sessions = files
-                .map(f => {
-                    const data = readJSON(path.join(sessionDir, f));
-                    if (!data) return null;
-                    return {
-                        id: data.id || f.replace('.json', ''),
-                        updatedAt: data.updatedAt || data.createdAt || ''
-                    };
-                })
-                .filter(Boolean);
-
-            if (sessions.length > 0) {
-                sessions.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
-                activeChatId = sessions[0].id;
-            } else {
-                activeChatId = files[0].replace('.json', '');
-            }
-        } else {
-            activeChatId = uuidv4();
-            const now = new Date().toISOString();
-            writeJSON(path.join(sessionDir, `${activeChatId}.json`), {
-                id: activeChatId,
-                groupId,
-                title: 'New Chat',
-                messages: [],
-                createdAt: now,
-                updatedAt: now
-            });
-        }
-    }
-
-    const chatFp = safeGroupChatPath(groupId, activeChatId);
-    if (!chatFp) return null;
-    const chat = readJSON(chatFp, {
-        id: activeChatId,
-        groupId,
-        title: 'New Chat',
-        messages: [],
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
-    });
-    if (!Array.isArray(chat.messages)) chat.messages = [];
-    return { chatFp, chat, activeChatId };
-}
-
-async function callGroupCharacterLLM({ group, messages, targetCharacterId, memFp, chatFp = null, userPromptContext = '' }) {
-    const baseUrl = process.env.BASE_URL;
-    const apiKey = process.env.API_KEY || 'sk-colab-local';
-    const modelName = process.env.MODEL_NAME || 'character1';
-
-    if (!baseUrl || baseUrl.includes('your-colab-url')) {
-        throw new Error('Please configure your Colab BASE_URL in Settings first.');
-    }
-
-    const charFp = safePath(CHARACTERS_DIR, targetCharacterId);
-    const char = charFp ? readJSON(charFp) : null;
-    if (!char) throw new Error('Target character not found');
-
-    const rawMemory = readJSON(memFp, { characterId: targetCharacterId, facts: [], summaries: [], importantEvents: [], personaId: '1' });
-    const groupMemFp = safePath(GROUP_MEMORY_DIR, group.id);
-    const rawGroupMemory = groupMemFp ? readJSON(groupMemFp, { groupId: group.id, facts: [], summaries: [], importantEvents: [], personaId: group.activePersonaId || '1' }) : null;
-
-    // Identify user persona name (fall back to personas[0]?.name || 'User' if personaId was deleted)
-    const personas = getPersonas();
-    const effectivePersonaId = String((rawGroupMemory && rawGroupMemory.personaId) || group.activePersonaId || rawMemory.personaId || (personas[0] && personas[0].id) || '1');
-    const foundPersona = effectivePersonaId
-        ? personas.find(p => String(p.id) === effectivePersonaId)
-        : null;
-    const userName = (foundPersona && foundPersona.name) || (personas[0] && personas[0].name) || 'User';
-
-    const memory = getPersonaMemorySlot(rawMemory, effectivePersonaId, 'characterId', targetCharacterId);
-    const groupMemory = rawGroupMemory ? getPersonaMemorySlot(rawGroupMemory, effectivePersonaId, 'groupId', group.id) : null;
-
-    // Load other member info for context
-    const otherMembers = (group.characterIds || [])
-        .filter(cid => cid !== targetCharacterId)
-        .map(cid => {
-            const cFp = safePath(CHARACTERS_DIR, cid);
-            const c = cFp ? readJSON(cFp) : null;
-            if (!c) return null;
-            return {
-                name: c.name,
-                desc: (c.personality || '').substring(0, 150)
-            };
-        }).filter(Boolean);
-
-    // ── Build system prompt ──
-    let systemParts = [];
-    let genderStr = char.gender ? ` You are a ${char.gender}.` : '';
-    let ageStr = char.age ? ` You are ${char.age} years old.` : '';
-    systemParts.push(`You are ${char.name}.${genderStr}${ageStr} You must stay in character at all times.`);
-
-    if (char.personality) {
-        systemParts.push(`\n## Personality & Description\n${char.personality}`);
-    }
-    if (char.systemPrompt) {
-        systemParts.push(`\n## Additional Instructions\n${char.systemPrompt}`);
-    }
-    if (char.exampleDialogue) {
-        systemParts.push(`\n## Example Dialogue Style\n${char.exampleDialogue}`);
-    }
-
-    // Group context
-    systemParts.push(`\n## Group Chat Setting`);
-    systemParts.push(`You are taking part in a group chat named "${group.name}".`);
-    if (group.scenario) {
-        systemParts.push(`Current Scene / Location:\n${group.scenario}`);
-    }
-    systemParts.push(`Participants in this room:`);
-    systemParts.push(`- ${userName} (The User)`);
-    systemParts.push(`- ${char.name} (YOU)`);
-    otherMembers.forEach(m => {
-        systemParts.push(`- ${m.name}${m.desc ? `: ${m.desc}` : ''}`);
-    });
-
-    if (groupMemory && groupMemory.facts && groupMemory.facts.length > 0) {
-        systemParts.push(`\n## Shared Group Facts\n${groupMemory.facts.map(f => `- ${f}`).join('\n')}`);
-    }
-    if (groupMemory && groupMemory.importantEvents && groupMemory.importantEvents.length > 0) {
-        const recentGroupEvents = groupMemory.importantEvents.filter(e => e && typeof e === 'object').slice(-10);
-        if (recentGroupEvents.length > 0) {
-            systemParts.push(`\n## Shared Group Important Events\n${recentGroupEvents.map(e => `- [${e.date || 'Unknown date'}] ${e.title ? e.title + ': ' : ''}${e.description || ''}`).join('\n')}`);
-        }
-    }
-    if (groupMemory && groupMemory.summaries && groupMemory.summaries.length > 0) {
-        const recentGroupSummaries = groupMemory.summaries.slice(-5);
-        systemParts.push(`\n## Previous Group Conversation Summaries\n${recentGroupSummaries.map(s => `- ${s}`).join('\n')}`);
-    }
-    if (memory.facts && memory.facts.length > 0) {
-        systemParts.push(`\n## Important Facts You Remember\n${memory.facts.map(f => `- ${f}`).join('\n')}`);
-    }
-    if (memory.importantEvents && memory.importantEvents.length > 0) {
-        const recentEvents = memory.importantEvents.filter(e => e && typeof e === 'object').slice(-10);
-        if (recentEvents.length > 0) {
-            systemParts.push(`\n## Important Events You Remember\n${recentEvents.map(e => `- [${e.date || 'Unknown date'}] ${e.title ? e.title + ': ' : ''}${e.description || ''}`).join('\n')}`);
-        }
-    }
-    if (memory.summaries && memory.summaries.length > 0) {
-        const recentSummaries = memory.summaries.slice(-5);
-        systemParts.push(`\n## Previous Conversation Summaries\n${recentSummaries.map(s => `- ${s}`).join('\n')}`);
-    }
-    const personaPrompt = formatPersonaPrompt(effectivePersonaId);
-    if (personaPrompt) {
-        systemParts.push(personaPrompt);
-    }
-
-    systemParts.push(`\n## Group Chat Roleplay Rules
-1. Stay fully in character as ${char.name}. Never break character, and never refer to yourself as an AI or language model.
-2. Only speak and act as ${char.name}. NEVER generate dialogue or narration on behalf of ${userName} or any other character. Only produce your own response.
-3. React naturally to what the others have said, speaking to ${userName} or addressing other characters by name as appropriate.
-4. Keep responses punchy and concise (1-2 short paragraphs, 3-6 sentences total).
-5. Do NOT prefix your output with "${char.name}:" or "[${char.name}]:" — speak directly in first-person.`);
-
-    const systemMessage = replaceUserMacro(systemParts.join('\n'), userName);
-
-    // ── Build perspective-aware message history ──
-    const promptMessages = [{ role: 'system', content: systemMessage }];
-    const recent = (messages !== undefined ? messages : (group.messages || [])).slice(-30);
-    recent.forEach(m => {
-        const rawMsgContent = (m.alternates && m.selectedAlternate !== undefined)
-            ? (m.alternates[m.selectedAlternate] || m.content)
-            : (m.alternates?.[0] || m.content);
-        const content = replaceUserMacro(rawMsgContent, userName);
-        if (m.senderId === targetCharacterId) {
-            promptMessages.push({ role: 'assistant', content });
-        } else {
-            const senderTag = m.senderName || (m.senderType === 'user' ? userName : 'Someone');
-            promptMessages.push({ role: 'user', content: `[${senderTag}]: ${content}` });
-        }
-    });
-    if (recent.length === 0) {
-        promptMessages.push({ role: 'user', content: '[Begin the group roleplay in character based on the group setting above.]' });
-    }
-
-    // Call llama.cpp API
-    const endpoint = `${baseUrl.replace(/\/$/, '')}/v1/chat/completions`;
-    console.log(`📤 Sending Group LLM request to ${endpoint} for ${char.name} in group "${group.name}" (${promptMessages.length} msgs)`);
-
-    const response = await fetchWithRetry(endpoint, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${apiKey}`
-        },
-        body: JSON.stringify({
-            model: modelName,
-            messages: promptMessages,
-            ...getModelParams()
-        })
-    }, 2);
-
-    if (!response.ok) {
-        const errText = await response.text();
-        const cleanError = parseErrorResponse(response.status, errText);
-        throw new Error(cleanError);
-    }
-
-    const data = await response.json();
-    const rawContent = data.choices?.[0]?.message?.content || '...';
-    let assistantContent = cleanAssistantResponse(rawContent);
-
-    // Strip leading name prefix if hallucinated
-    const escapedCharName = (char.name || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const prefixRegex = new RegExp(`^(\\[?${escapedCharName}\\]?:?\\s*)+`, 'i');
-    assistantContent = assistantContent.replace(prefixRegex, '').trim();
-
-    // Auto extract user preferences ONLY when there is an actual user message
-    // and only if the group/chat/character still exists on disk
-    const isRealUserMessage = userPromptContext && userPromptContext !== 'Turn continuation' && userPromptContext !== 'Regenerate response';
-    const groupFp = safePath(GROUP_CHATS_DIR, group.id);
-    const chatStillExists = !chatFp || fs.existsSync(chatFp);
-    const groupStillExists = groupFp && fs.existsSync(groupFp);
-    if (isRealUserMessage && chatStillExists && groupStillExists) {
-        if (fs.existsSync(charFp)) {
-            autoExtractMemory(memFp, userPromptContext, assistantContent, effectivePersonaId);
-        }
-        if (groupMemFp) {
-            autoExtractMemory(groupMemFp, userPromptContext, assistantContent, effectivePersonaId);
-        }
-    }
-
-    return {
-        character: char,
-        content: assistantContent
-    };
-}
-
-// User sends a message to group & target character responds
-app.post('/api/group-chat/send', async (req, res) => {
-    const { groupId, chatId, targetCharacterId, userMessage } = req.body;
-    if (!groupId || !targetCharacterId || !userMessage) {
-        return res.status(400).json({ error: 'Missing groupId, targetCharacterId, or userMessage' });
-    }
-    const groupFp = safePath(GROUP_CHATS_DIR, groupId);
-    const memFp = safePath(PRIVATE_MEMORY_DIR, targetCharacterId);
-    if (!groupFp || !memFp) return res.status(400).json({ error: 'Invalid id' });
-
-    const group = readJSON(groupFp);
-    if (!group) return res.status(404).json({ error: 'Group not found' });
-
-    const sessionInfo = resolveGroupSession(groupId, chatId);
-    if (!sessionInfo) return res.status(400).json({ error: 'Failed to resolve group session' });
-    const { chatFp, chat, activeChatId } = sessionInfo;
-
-    // User persona name (fall back to personas[0]?.name || 'User' if personaId was deleted)
-    const personas = getPersonas();
-    const groupMemFp = safePath(GROUP_MEMORY_DIR, groupId);
-    const groupMemory = groupMemFp ? readJSON(groupMemFp) : null;
-    const personaId = (groupMemory && groupMemory.personaId) || group.activePersonaId;
-    const foundPersona = personaId
-        ? personas.find(p => String(p.id) === String(personaId))
-        : null;
-    const userName = (foundPersona && foundPersona.name) || (personas[0] && personas[0].name) || 'User';
-
-    // Append user message and write to disk so user can edit while LLM is thinking
-    const now = new Date().toISOString();
-    const userMsgId = req.body.userMessageId || uuidv4();
-    const userMsgObj = {
-        id: userMsgId,
-        senderType: 'user',
-        senderId: 'user',
-        senderName: userName,
-        content: userMessage,
-        timestamp: now
-    };
-    chat.messages.push(userMsgObj);
-    writeJSON(chatFp, chat);
-
-    try {
-        const { character, content } = await callGroupCharacterLLM({
-            group,
-            messages: chat.messages,
-            targetCharacterId,
-            memFp,
-            chatFp,
-            userPromptContext: userMessage
-        });
-
-        // Fresh re-read before write; if group or chat session was deleted while in-flight, do not resurrect
-        const freshChat = readJSON(chatFp);
-        const freshGroup = readJSON(groupFp);
-        if (!freshChat || !freshGroup) {
-            return res.status(404).json({ error: 'Group or chat session was deleted' });
-        }
-        if (!Array.isArray(freshChat.messages)) freshChat.messages = [];
-
-        if (!freshChat.messages.some(m => m.id === userMsgId)) {
-            freshChat.messages.push(userMsgObj);
-        }
-
-        const replyMsg = {
-            id: uuidv4(),
-            senderType: 'character',
-            senderId: targetCharacterId,
-            senderName: character.name,
-            senderAvatar: character.avatar || '',
-            content: content,
-            timestamp: new Date().toISOString()
-        };
-        freshChat.messages.push(replyMsg);
-
-        // Auto-set chat session title from first user message if default
-        const isDefaultTitle = !freshChat.title || freshChat.title === 'New Chat' || freshChat.title === 'New Session' || freshChat.title === 'Untitled Chat';
-        if (isDefaultTitle && freshChat.messages.length <= 2) {
-            freshChat.title = userMessage.substring(0, 60) + (userMessage.length > 60 ? '…' : '');
-        }
-
-        freshChat.updatedAt = new Date().toISOString();
-        writeJSON(chatFp, freshChat);
-
-        // Update group updated timestamp
-        freshGroup.updatedAt = new Date().toISOString();
-        writeJSON(groupFp, freshGroup);
-
-        res.json({
-            userMessage: userMsgObj,
-            replyMessage: replyMsg,
-            groupId: freshGroup.id,
-            chatId: activeChatId,
-            title: freshChat.title
-        });
-    } catch (err) {
-        console.error('Group chat error:', err);
-        try {
-            const freshChat = readJSON(chatFp);
-            if (freshChat && Array.isArray(freshChat.messages)) {
-                freshChat.messages = freshChat.messages.filter(m => m.id !== userMsgId);
-                writeJSON(chatFp, freshChat);
-            }
-        } catch (cleanupErr) {
-            console.error('Error cleaning up group message:', cleanupErr);
-        }
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// Cross-character turn or manual trigger without a new user message
-app.post('/api/group-chat/turn', async (req, res) => {
-    const { groupId, chatId, targetCharacterId, replyToMessageId } = req.body;
-    if (!groupId || !targetCharacterId) {
-        return res.status(400).json({ error: 'Missing groupId or targetCharacterId' });
-    }
-    const groupFp = safePath(GROUP_CHATS_DIR, groupId);
-    const memFp = safePath(PRIVATE_MEMORY_DIR, targetCharacterId);
-    if (!groupFp || !memFp) return res.status(400).json({ error: 'Invalid id' });
-
-    const group = readJSON(groupFp);
-    if (!group) return res.status(404).json({ error: 'Group not found' });
-
-    const sessionInfo = resolveGroupSession(groupId, chatId);
-    if (!sessionInfo) return res.status(400).json({ error: 'Failed to resolve group session' });
-    const { chatFp, chat, activeChatId } = sessionInfo;
-
-    try {
-        const { character, content } = await callGroupCharacterLLM({
-            group,
-            messages: chat.messages,
-            targetCharacterId,
-            memFp,
-            chatFp,
-            userPromptContext: 'Turn continuation'
-        });
-
-        const freshChat = readJSON(chatFp);
-        const freshGroup = readJSON(groupFp);
-        if (!freshChat || !freshGroup) {
-            return res.status(404).json({ error: 'Group or chat session was deleted' });
-        }
-        if (!Array.isArray(freshChat.messages)) freshChat.messages = [];
-
-        const replyMsg = {
-            id: uuidv4(),
-            senderType: 'character',
-            senderId: targetCharacterId,
-            senderName: character.name,
-            senderAvatar: character.avatar || '',
-            content: content,
-            replyTo: replyToMessageId || null,
-            timestamp: new Date().toISOString()
-        };
-        freshChat.messages.push(replyMsg);
-        freshChat.updatedAt = new Date().toISOString();
-        writeJSON(chatFp, freshChat);
-
-        freshGroup.updatedAt = new Date().toISOString();
-        writeJSON(groupFp, freshGroup);
-
-        res.json({
-            replyMessage: replyMsg,
-            groupId: freshGroup.id,
-            chatId: activeChatId
-        });
-    } catch (err) {
-        console.error('Group turn error:', err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// Regenerate character message in group
-app.post('/api/group-chat/regenerate', async (req, res) => {
-    const { groupId, chatId } = req.body;
-    if (!groupId) return res.status(400).json({ error: 'Missing groupId' });
-    const groupFp = safePath(GROUP_CHATS_DIR, groupId);
-    if (!groupFp) return res.status(400).json({ error: 'Invalid group id' });
-
-    const group = readJSON(groupFp);
-    if (!group) return res.status(404).json({ error: 'Group not found' });
-
-    const sessionInfo = resolveGroupSession(groupId, chatId);
-    if (!sessionInfo) return res.status(400).json({ error: 'Failed to resolve group session' });
-    const { chatFp, chat, activeChatId } = sessionInfo;
-
-    if (!Array.isArray(chat.messages) || chat.messages.length === 0) {
-        return res.status(404).json({ error: 'Empty group chat session' });
-    }
-
-    const targetIndex = req.body.messageId
-        ? chat.messages.findIndex(m => m.id === req.body.messageId)
-        : chat.messages.length - 1;
-    if (targetIndex === -1) {
-        return res.status(404).json({ error: 'Message to regenerate not found' });
-    }
-    const targetMsg = chat.messages[targetIndex];
-    if (!targetMsg || targetMsg.senderType !== 'character') {
-        return res.status(400).json({ error: 'Target message is not from a character' });
-    }
-    if (!targetMsg.id) {
-        targetMsg.id = uuidv4();
-        writeJSON(chatFp, chat);
-    }
-    const targetMsgId = targetMsg.id;
-
-    const targetCharacterId = targetMsg.senderId;
-    const memFp = safePath(PRIVATE_MEMORY_DIR, targetCharacterId);
-    if (!memFp) return res.status(400).json({ error: 'Invalid memory id' });
-
-    const tempMessages = chat.messages.slice(0, targetIndex);
-
-    try {
-        const { character, content } = await callGroupCharacterLLM({
-            group,
-            messages: tempMessages,
-            targetCharacterId,
-            memFp,
-            chatFp,
-            userPromptContext: 'Regenerate response'
-        });
-
-        const freshChat = readJSON(chatFp);
-        const freshGroup = readJSON(groupFp);
-        if (!freshChat || !freshGroup) {
-            return res.status(404).json({ error: 'Group or chat session was deleted' });
-        }
-        if (!Array.isArray(freshChat.messages)) freshChat.messages = [];
-
-        let freshTargetIndex = freshChat.messages.findIndex(m => m.id === targetMsgId);
-        let msgToUpdate = freshTargetIndex !== -1 ? freshChat.messages[freshTargetIndex] : null;
-
-        if (!msgToUpdate && !req.body.messageId) {
-            for (let i = freshChat.messages.length - 1; i >= 0; i--) {
-                if (freshChat.messages[i].senderType === 'character') {
-                    freshTargetIndex = i;
-                    msgToUpdate = freshChat.messages[i];
-                    break;
-                }
-            }
-        }
-
-        if (!msgToUpdate) return res.status(404).json({ error: 'Message not found' });
-
-        if (!Array.isArray(msgToUpdate.alternates)) {
-            msgToUpdate.alternates = [msgToUpdate.content];
-            msgToUpdate.selectedAlternate = 0;
-        }
-        msgToUpdate.alternates.push(content);
-        msgToUpdate.selectedAlternate = msgToUpdate.alternates.length - 1;
-        msgToUpdate.content = content;
-        msgToUpdate.timestamp = new Date().toISOString();
-
-        freshChat.updatedAt = new Date().toISOString();
-        writeJSON(chatFp, freshChat);
-
-        freshGroup.updatedAt = new Date().toISOString();
-        writeJSON(groupFp, freshGroup);
-
-        res.json({
-            content: content,
-            alternates: msgToUpdate.alternates,
-            selectedAlternate: msgToUpdate.selectedAlternate,
-            groupId: freshGroup.id,
-            chatId: activeChatId,
-            messageId: msgToUpdate.id,
-            messageIndex: freshTargetIndex
-        });
-    } catch (err) {
-        console.error('Group regenerate error:', err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// Set selected alternate in group message
-app.put('/api/groups/:groupId/alternate', (req, res) => {
-    const { chatId, selectedAlternate, messageId } = req.body;
-    let messageIndex = req.body.messageIndex !== undefined ? Number(req.body.messageIndex) : undefined;
-    const sessionInfo = resolveGroupSession(req.params.groupId, chatId);
-    if (!sessionInfo) return res.status(400).json({ error: 'Invalid session' });
-    const { chatFp, chat } = sessionInfo;
-
-    if (!Array.isArray(chat.messages)) {
-        return res.status(404).json({ error: 'Message not found' });
-    }
-    if (!Number.isInteger(selectedAlternate) || selectedAlternate < 0) {
-        return res.status(400).json({ error: 'selectedAlternate must be non-negative integer' });
-    }
-
-    let targetMsg;
-    if (messageId) {
-        targetMsg = chat.messages.find(m => m.id === messageId);
-    }
-    if (!targetMsg && Number.isInteger(messageIndex) && messageIndex >= 0 && messageIndex < chat.messages.length) {
-        targetMsg = chat.messages[messageIndex];
-    }
-    if (!targetMsg) {
-        return res.status(404).json({ error: 'Message not found' });
-    }
-
-    targetMsg.selectedAlternate = selectedAlternate;
-    if (Array.isArray(targetMsg.alternates) && targetMsg.alternates[selectedAlternate] !== undefined) {
-        targetMsg.content = targetMsg.alternates[selectedAlternate];
-    }
-    writeJSON(chatFp, chat);
-    res.json({ ok: true });
 });
 
 // ══════════════════════════════════════════════════════════════

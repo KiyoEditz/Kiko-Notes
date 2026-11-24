@@ -72,6 +72,8 @@
     "memory.summary": "Ringkasan Percakapan",
     "memory.btn_add": "+ Tambah",
     "memory.btn_ai_summary": "AI Summarize Chat",
+    "memory.btn_extract_facts": "Ekstrak Fakta",
+    "memory.btn_dump_chat": "Dump Chat",
     "memory.btn_save": "Simpan Memory",
     "memory.empty_facts": "Belum ada fakta tersimpan",
     "memory.empty_user": "Belum ada info user",

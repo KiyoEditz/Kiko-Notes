@@ -72,6 +72,8 @@
     "memory.summary": "Chat Summaries",
     "memory.btn_add": "+ Add",
     "memory.btn_ai_summary": "AI Summarize Chat",
+    "memory.btn_extract_facts": "Extract Facts",
+    "memory.btn_dump_chat": "Dump Chat",
     "memory.btn_save": "Save Memory",
     "memory.empty_facts": "No facts saved yet",
     "memory.empty_user": "No user info yet",
