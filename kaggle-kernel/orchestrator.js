@@ -23,6 +23,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { spawnSync } = require('child_process');
+const imageSync = require('../lib/image-sync');
 
 const KAGGLE_ROOT = __dirname;
 const CONFIG_DIR = path.join(KAGGLE_ROOT, 'config');
@@ -443,21 +444,34 @@ function startHeartbeatLoop() {
         clearInterval(orchestratorState.heartbeatTimer);
     }
 
-    orchestratorState.heartbeatTimer = setInterval(async () => {
+    const pingOnce = async () => {
         if (!orchestratorState.tunnelUrl) return;
         try {
             const url = `${orchestratorState.tunnelUrl.replace(/\/+$/, '')}/__aichat_admin/heartbeat`;
-            await fetch(url, {
+            const res = await fetch(url, {
                 method: 'GET',
                 headers: {
                     'Authorization': `Bearer ${orchestratorState.apiKey}`
                 },
                 signal: AbortSignal.timeout(10000)
             });
+            if (res.ok) {
+                const data = await res.json().catch(() => null);
+                if (data && data.marker && data.marker !== imageSync.getSessionMarker()) {
+                    imageSync.reconcileWithBackend({
+                        baseUrl: orchestratorState.tunnelUrl,
+                        apiKey: orchestratorState.apiKey,
+                        knownMarker: data.marker
+                    }).catch(() => {});
+                }
+            }
         } catch {
             // Transient network hiccup; 30-minute window allows plenty of retries
         }
-    }, HEARTBEAT_INTERVAL_MS);
+    };
+
+    pingOnce();
+    orchestratorState.heartbeatTimer = setInterval(pingOnce, HEARTBEAT_INTERVAL_MS);
 
     if (orchestratorState.heartbeatTimer.unref) {
         orchestratorState.heartbeatTimer.unref();

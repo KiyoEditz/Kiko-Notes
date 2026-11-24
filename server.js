@@ -13,6 +13,7 @@ const fs = require('fs');
 const os = require('os');
 const { v4: uuidv4 } = require('uuid');
 const memoryDb = require('./lib/memory-db');
+const imageSync = require('./lib/image-sync');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -335,7 +336,43 @@ app.post('/api/config', (req, res) => {
     const tmpPath = `${envPath}.${process.pid}.${Date.now()}.tmp`;
     fs.writeFileSync(tmpPath, envContent, 'utf8');
     fs.renameSync(tmpPath, envPath);
+
+    if (baseUrl !== undefined && baseUrl.trim()) {
+        imageSync.invalidateSessionMarker();
+        imageSync.reconcileWithBackend({
+            baseUrl: process.env.BASE_URL,
+            apiKey: process.env.API_KEY
+        }).catch(() => {});
+    }
+
     res.json({ ok: true });
+});
+
+// ══════════════════════════════════════════════════════════════
+//  IMAGE SYNC API (Local JPEG Store + Manifest Sync)
+// ══════════════════════════════════════════════════════════════
+
+app.post('/api/images/upload', (req, res) => {
+    try {
+        const { dataUrl, width, height, sha256 } = req.body || {};
+        if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/jpeg;base64,')) {
+            return res.status(400).json({ error: 'Expected base64 JPEG dataUrl' });
+        }
+        const b64 = dataUrl.slice('data:image/jpeg;base64,'.length);
+        const buf = Buffer.from(b64, 'base64');
+        const saved = imageSync.saveLocalImage(buf, { width, height, expectedHash: sha256 || null });
+        res.json({ ok: true, ...saved });
+    } catch (err) {
+        res.status(400).json({ error: err.message });
+    }
+});
+
+app.get('/api/images/:id', (req, res) => {
+    const buf = imageSync.readLocalImage(req.params.id);
+    if (!buf) return res.status(404).json({ error: 'Image not found' });
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    res.send(buf);
 });
 
 // ══════════════════════════════════════════════════════════════
@@ -1142,10 +1179,61 @@ function parseErrorResponse(status, text) {
 //  CHAT COMPLETION PROXY — Forward to llama-server with memory
 // ══════════════════════════════════════════════════════════════
 
-app.post('/api/chat/send', async (req, res) => {
-    const { characterId, chatId, userMessage } = req.body;
+function buildMultimodalContent(text, imageIds) {
+    if (!Array.isArray(imageIds) || imageIds.length === 0) return text;
+    const parts = [];
+    if (text && text.trim()) {
+        parts.push({ type: 'text', text });
+    }
+    for (const id of imageIds) {
+        if (imageSync.IMAGE_ID_RE.test(id)) {
+            parts.push({ type: 'image_ref', id });
+        }
+    }
+    return parts.length > 0 ? parts : text;
+}
 
-    if (!characterId || !chatId || !userMessage) {
+async function fetchChatWithImageSync({ endpoint, baseUrl, apiKey, payloadObj, referencedIds }) {
+    if (referencedIds.length > 0) {
+        await imageSync.reconcileWithBackend({ baseUrl, apiKey, candidateIds: referencedIds });
+    }
+
+    const sendOnce = async () => {
+        const headers = {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`
+        };
+        const marker = imageSync.getSessionMarker();
+        if (marker) headers['X-Session-Marker'] = marker;
+
+        return fetchWithRetry(endpoint, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(payloadObj)
+        }, 2);
+    };
+
+    let response = await sendOnce();
+    if (response.status === 409 || response.status === 424) {
+        console.log(`🔄 [ImageSync] Backend returned HTTP ${response.status}; re-syncing and retrying once...`);
+        await imageSync.reconcileWithBackend({
+            baseUrl,
+            apiKey,
+            candidateIds: referencedIds,
+            force: true
+        });
+        response = await sendOnce();
+    }
+    return response;
+}
+
+app.post('/api/chat/send', async (req, res) => {
+    const { characterId, chatId, userMessage = '', images = [] } = req.body;
+    const validImageIds = Array.isArray(images)
+        ? images.filter(id => typeof id === 'string' && imageSync.IMAGE_ID_RE.test(id))
+        : [];
+
+    if (!characterId || !chatId || (!userMessage && validImageIds.length === 0)) {
         return res.status(400).json({ error: 'Missing characterId, chatId, or userMessage' });
     }
     if (typeof userMessage !== 'string') {
@@ -1270,41 +1358,55 @@ You have access to the memories listed above. When the user shares important per
     const messages = [{ role: 'system', content: systemMessage }];
 
     // Include recent chat history (L0 window)
+    const referencedImageIds = new Set(validImageIds);
     recentMessages.forEach(m => {
         const content = (m.alternates && m.selectedAlternate !== undefined)
             ? (m.alternates[m.selectedAlternate] || m.content)
             : m.content;
-        messages.push({ role: m.role, content: replaceUserMacro(content, userName) });
+        const msgImages = Array.isArray(m.images) ? m.images.filter(id => imageSync.IMAGE_ID_RE.test(id)) : [];
+        msgImages.forEach(id => referencedImageIds.add(id));
+        messages.push({
+            role: m.role,
+            content: buildMultimodalContent(replaceUserMacro(content, userName), msgImages)
+        });
     });
 
     // Add current user message
-    messages.push({ role: 'user', content: replaceUserMacro(userMessage, userName) });
+    messages.push({
+        role: 'user',
+        content: buildMultimodalContent(replaceUserMacro(userMessage, userName), validImageIds)
+    });
 
     // Save user message immediately to chat history so user can edit it while LLM is generating
     const now = new Date().toISOString();
     const userMsgId = req.body.userMessageId || uuidv4();
-    const userMsgObj = { id: userMsgId, role: 'user', content: userMessage, timestamp: now };
+    const userMsgObj = {
+        id: userMsgId,
+        role: 'user',
+        content: userMessage,
+        ...(validImageIds.length > 0 ? { images: validImageIds } : {}),
+        timestamp: now
+    };
     chat.messages.push(userMsgObj);
     writeJSON(chatFp, chat);
 
-    // ── Call llama-server (with retry) ──
+    // ── Call llama-server (with retry + Image Sync marker recovery) ──
     try {
         const endpoint = `${baseUrl.replace(/\/$/, '')}/v1/chat/completions`;
 
-        console.log(`📤 Sending to ${endpoint} (model: ${modelName}, messages: ${messages.length})`);
+        console.log(`📤 Sending to ${endpoint} (model: ${modelName}, messages: ${messages.length}, images: ${referencedImageIds.size})`);
 
-        const response = await fetchWithRetry(endpoint, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKey}`
-            },
-            body: JSON.stringify({
+        const response = await fetchChatWithImageSync({
+            endpoint,
+            baseUrl,
+            apiKey,
+            referencedIds: Array.from(referencedImageIds),
+            payloadObj: {
                 model: modelName,
                 messages: messages,
                 ...getModelParams()
-            })
-        }, 2); // retry up to 2 times
+            }
+        });
 
         if (!response.ok) {
             const errText = await response.text();
@@ -1472,29 +1574,34 @@ app.post('/api/chat/regenerate', async (req, res) => {
 
     // Build prompt context using ONLY messages strictly BEFORE targetIndex
     const contextMessages = chat.messages.slice(0, targetIndex).slice(-30);
+    const referencedImageIds = new Set();
     contextMessages.forEach(m => {
         const content = m.alternates?.[m.selectedAlternate ?? 0] || m.content;
-        messages.push({ role: m.role, content: replaceUserMacro(content, userName) });
+        const msgImages = Array.isArray(m.images) ? m.images.filter(id => imageSync.IMAGE_ID_RE.test(id)) : [];
+        msgImages.forEach(id => referencedImageIds.add(id));
+        messages.push({
+            role: m.role,
+            content: buildMultimodalContent(replaceUserMacro(content, userName), msgImages)
+        });
     });
 
     if (contextMessages.length === 0) {
-        // Regenerating the very first message (the character's opening
-        // greeting) — there's no prior turn to give the model, so it would
-        // otherwise receive only the system prompt and no user turn.
         messages.push({ role: 'user', content: '[Begin the roleplay with your opening message, based on the scenario above.]' });
     }
 
     try {
         const endpoint = `${baseUrl.replace(/\/$/, '')}/v1/chat/completions`;
-        const response = await fetchWithRetry(endpoint, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-            body: JSON.stringify({
+        const response = await fetchChatWithImageSync({
+            endpoint,
+            baseUrl,
+            apiKey,
+            referencedIds: Array.from(referencedImageIds),
+            payloadObj: {
                 model: modelName,
                 messages: messages,
                 ...getModelParams()
-            })
-        }, 2);
+            }
+        });
 
         if (!response.ok) {
             const errText = await response.text();
@@ -2121,5 +2228,10 @@ app.listen(PORT, '0.0.0.0', () => {
 
     if (IS_BETA_KAGGLE) {
         startBetaKaggleOrchestrator(__dirname);
+    } else if (process.env.BASE_URL && !process.env.BASE_URL.includes('your-colab-url')) {
+        imageSync.reconcileWithBackend({
+            baseUrl: process.env.BASE_URL,
+            apiKey: process.env.API_KEY
+        }).catch(() => {});
     }
 });

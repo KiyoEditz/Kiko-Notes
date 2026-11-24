@@ -632,12 +632,16 @@ function renderMessages(messages, shouldScroll = true) {
         const touchEvents = isLastAssistant ? 'ontouchstart="handleTouchStart(event)" ontouchend="handleTouchEnd(event, this)"' : '';
         const msgId = m.id || '';
 
+    const msgImagesHtml = Array.isArray(m.images) && m.images.length > 0
+            ? `<div class="message-images">${m.images.map(id => `<img class="message-image-thumb" src="/api/images/${escapeHtml(id)}" alt="attachment" loading="lazy">`).join('')}</div>`
+            : '';
+
         return `
             <div class="message ${m.role}" data-index="${index}" data-id="${msgId}">
                 <div class="message-avatar">${avatar}</div>
                 <div>
                     <div class="message-bubble-container" ${touchEvents}>
-                        <div class="message-bubble">${contentHtml}</div>
+                        <div class="message-bubble">${msgImagesHtml}${contentHtml}</div>
                         ${regenerateBtn}
                     </div>
                     ${alternatesHtml}
@@ -659,13 +663,14 @@ function renderMessages(messages, shouldScroll = true) {
     }
 }
 
-function appendMessage(role, content, isLastAssistant = false, messageId = null) {
+function appendMessage(role, content, isLastAssistant = false, messageId = null, images = []) {
     if (!Array.isArray(state.currentMessages)) {
         state.currentMessages = [];
     }
     state.currentMessages.push({
         role,
         content,
+        ...(Array.isArray(images) && images.length > 0 ? { images } : {}),
         timestamp: new Date().toISOString(),
         id: messageId || ''
     });
@@ -698,6 +703,10 @@ function appendMessage(role, content, isLastAssistant = false, messageId = null)
     const touchEvents = isLastAssistant ? 'ontouchstart="handleTouchStart(event)" ontouchend="handleTouchEnd(event, this)"' : '';
     const msgId = messageId || '';
 
+    const msgImagesHtml = Array.isArray(images) && images.length > 0
+        ? `<div class="message-images">${images.map(id => `<img class="message-image-thumb" src="/api/images/${escapeHtml(id)}" alt="attachment" loading="lazy">`).join('')}</div>`
+        : '';
+
     const div = document.createElement('div');
     div.className = `message ${role}`;
     div.dataset.index = index;
@@ -706,7 +715,7 @@ function appendMessage(role, content, isLastAssistant = false, messageId = null)
         <div class="message-avatar">${avatar}</div>
         <div>
             <div class="message-bubble-container" ${touchEvents}>
-                <div class="message-bubble">${formatMessageContent(content)}</div>
+                <div class="message-bubble">${msgImagesHtml}${formatMessageContent(content)}</div>
                 ${regenerateBtn}
             </div>
             <div class="message-meta">
@@ -759,10 +768,95 @@ window.scrollToBottom = scrollToBottom;
 //  SEND MESSAGE
 // ══════════════════════════════════════════════════════════
 
+async function compressImageFileToJpeg(file, maxEdge = 1024, quality = 0.85) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+            const img = new Image();
+            img.onload = () => {
+                let width = img.width;
+                let height = img.height;
+                if (width > maxEdge || height > maxEdge) {
+                    if (width >= height) {
+                        height = Math.round((height * maxEdge) / width);
+                        width = maxEdge;
+                    } else {
+                        width = Math.round((width * maxEdge) / height);
+                        height = maxEdge;
+                    }
+                }
+                const canvas = document.createElement('canvas');
+                canvas.width = width;
+                canvas.height = height;
+                const ctx = canvas.getContext('2d');
+                ctx.fillStyle = '#FFFFFF';
+                ctx.fillRect(0, 0, width, height);
+                ctx.drawImage(img, 0, 0, width, height);
+                resolve({
+                    dataUrl: canvas.toDataURL('image/jpeg', quality),
+                    width,
+                    height
+                });
+            };
+            img.onerror = () => reject(new Error('Failed to decode image'));
+            img.src = ev.target.result;
+        };
+        reader.onerror = () => reject(new Error('Failed to read file'));
+        reader.readAsDataURL(file);
+    });
+}
+
+function renderPendingImages() {
+    const bar = $('#pending-images-bar');
+    if (!bar) return;
+    const list = state.pendingImages || [];
+    if (list.length === 0) {
+        bar.style.display = 'none';
+        bar.innerHTML = '';
+        return;
+    }
+    bar.style.display = 'flex';
+    bar.innerHTML = list.map((img, idx) => `
+        <div class="pending-image-chip">
+            <img src="${escapeHtml(img.url)}" alt="pending">
+            <button type="button" class="pending-image-remove" onclick="removePendingImage(${idx})" title="Remove">✕</button>
+        </div>
+    `).join('');
+}
+
+function removePendingImage(idx) {
+    if (!Array.isArray(state.pendingImages)) return;
+    state.pendingImages.splice(idx, 1);
+    renderPendingImages();
+}
+window.removePendingImage = removePendingImage;
+
+async function handleChatImageFiles(files) {
+    if (!files || files.length === 0) return;
+    state.pendingImages = state.pendingImages || [];
+    for (const file of Array.from(files)) {
+        if (!file.type || !file.type.startsWith('image/')) continue;
+        try {
+            const compressed = await compressImageFileToJpeg(file);
+            const res = await api('POST', '/api/images/upload', compressed);
+            if (res && res.ok && res.id) {
+                state.pendingImages.push({ id: res.id, url: res.url, width: res.width, height: res.height });
+                renderPendingImages();
+            } else {
+                toast((res && res.error) || 'Failed to upload image', 'error');
+            }
+        } catch (err) {
+            toast(err.message || 'Image compression failed', 'error');
+        }
+    }
+}
+
 async function sendMessage() {
     const input = $('#chat-input');
     const text = input.value.trim();
-    if (!text) return;
+    const attachedImages = Array.isArray(state.pendingImages) ? [...state.pendingImages] : [];
+    const imageIds = attachedImages.map(i => i.id);
+    if (!text && imageIds.length === 0) return;
 
     if (!state.currentCharacterId || !state.currentChatId) return;
 
@@ -776,11 +870,13 @@ async function sendMessage() {
 
     state.sendingChats.add(requestChatId);
     input.value = '';
+    state.pendingImages = [];
+    renderPendingImages();
     autoResizeInput();
 
     // Show user message immediately with a unique ID
     const userMsgId = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : ('msg-' + Date.now() + '-' + Math.random().toString(36).substring(2, 9));
-    const userBubble = appendMessage('user', text, false, userMsgId);
+    const userBubble = appendMessage('user', text, false, userMsgId, imageIds);
     const editCountAtStart = state._chatEditedDuringSend || 0;
 
     // Update typing indicator & send button for this chat
@@ -791,6 +887,7 @@ async function sendMessage() {
             characterId: requestCharacterId,
             chatId: requestChatId,
             userMessage: text,
+            images: imageIds,
             userMessageId: userMsgId
         });
 
@@ -807,6 +904,8 @@ async function sendMessage() {
                     await loadChat(requestChatId, false);
                 }
                 input.value = text;
+                state.pendingImages = attachedImages;
+                renderPendingImages();
                 autoResizeInput();
             }
             toast(result.error, 'error');
@@ -1906,6 +2005,30 @@ function bindEvents() {
     // Chat
     const btnSidebarNewChat = $('#btn-sidebar-new-chat');
     if (btnSidebarNewChat) btnSidebarNewChat.addEventListener('click', () => startNewChat());
+    const btnAttachImg = $('#btn-attach-image');
+    const chatImgInput = $('#chat-image-input');
+    if (btnAttachImg && chatImgInput) {
+        btnAttachImg.addEventListener('click', () => chatImgInput.click());
+        chatImgInput.addEventListener('change', (e) => {
+            handleChatImageFiles(e.target.files);
+            e.target.value = '';
+        });
+    }
+    const chatInputEl = $('#chat-input');
+    if (chatInputEl) {
+        chatInputEl.addEventListener('paste', (e) => {
+            const items = e.clipboardData && e.clipboardData.items;
+            if (!items) return;
+            const imgFiles = [];
+            for (const item of items) {
+                if (item.kind === 'file' && item.type.startsWith('image/')) {
+                    const f = item.getAsFile();
+                    if (f) imgFiles.push(f);
+                }
+            }
+            if (imgFiles.length > 0) handleChatImageFiles(imgFiles);
+        });
+    }
     $('#chat-form').addEventListener('submit', (e) => {
         e.preventDefault();
         sendMessage();

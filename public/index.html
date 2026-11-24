@@ -113,7 +113,16 @@
                         <span class="typing-dot"></span>
                         <span class="typing-text" data-i18n="chat.typing">typing...</span>
                     </div>
+                    <div id="pending-images-bar" class="pending-images-bar" style="display:none"></div>
                     <form id="chat-form" class="chat-input-form">
+                        <input type="file" id="chat-image-input" accept="image/*" multiple style="display:none">
+                        <button type="button" class="btn-icon btn-attach-image" id="btn-attach-image" title="Attach image" aria-label="Attach image">
+                            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                                <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                                <circle cx="8.5" cy="8.5" r="1.5"/>
+                                <polyline points="21 15 16 10 5 21"/>
+                            </svg>
+                        </button>
                         <textarea id="chat-input" placeholder="Type a message..." data-i18n-placeholder="chat.input_placeholder" rows="1"></textarea>
                         <button type="submit" class="btn-send" id="btn-send" title="Send message" aria-label="Send message">
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">

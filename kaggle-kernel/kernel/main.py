@@ -19,8 +19,10 @@ Features:
 
 import asyncio
 import atexit
+import base64
 import gc
 import glob
+import hashlib
 import json
 import os
 import re
@@ -32,6 +34,7 @@ import sys
 import tarfile
 import threading
 import time
+import uuid
 import requests
 
 # =====================================================================
@@ -45,15 +48,17 @@ TUNNEL_DATASET_SLUG = os.environ.get("AICHAT_TUNNEL_DATASET_SLUG", "aichat-kaggl
 # =====================================================================
 # SERVER & MODEL CONFIGURATION
 # =====================================================================
-MODEL_REPO = "mradermacher/Gemma-4-Dark-Gemistry-31B-i1-GGUF:Q6_K"  # ~27 GB
+MODEL_REPO = "KiyoEditz/Elaina-gemma-4-31B-v0.1-GGUF:Q6_K"  # ~26.4 GB
+MMPROJ_FILE = "mmproj-F16.gguf"  # Downloaded directly from HuggingFace alongside model
 # Alternatives:
-# MODEL_REPO = "mradermacher/EVA-Qwen2.5-32B-v0.2-i1-GGUF:Q6_K"
-# MODEL_REPO = "bartowski/EVA-Qwen2.5-32B-v0.2-GGUF:Q4_K_M"
-# MODEL_REPO = "bartowski/Qwen2.5-32B-Instruct-GGUF:Q4_K_M"
+# MODEL_REPO = "KiyoEditz/Elaina-gemma-4-31B-v0.1-GGUF:Q4_K_M"  # ~19.5 GB
+# MODEL_REPO = "mradermacher/Gemma-4-Dark-Gemistry-31B-i1-GGUF:Q6_K"
 
 GATEWAY_PORT = 8080
 LLAMA_INTERNAL_PORT = 8081
 API_KEY = "sk-kaggle-local"
+STARTUP_MARKER = str(uuid.uuid4())
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
 
 # Auto-Idle Watchdog: 30 minutes (1800 seconds)
 IDLE_TIMEOUT_SECONDS = 1800
@@ -68,7 +73,7 @@ GITHUB_RELEASE_URL = (
 )
 GITHUB_RELEASES_API = "https://api.github.com/repos/KiyoEditz/AIChat-With-Notebooks/releases"
 
-PARALLEL_SLOTS = 4
+PARALLEL_SLOTS = 1  # Single-call playground mode
 CTX_SLOT = 8192
 NUM_CTX = PARALLEL_SLOTS * CTX_SLOT
 CACHE_RAM = 16384
@@ -76,6 +81,7 @@ GPU_IDS = "0,1"
 
 SCRATCH_DIR = "/kaggle/tmp" if os.path.isdir("/kaggle/tmp") else "/tmp"
 MODEL_DIR = f"{SCRATCH_DIR}/models"
+IMAGE_STORE_DIR = f"{SCRATCH_DIR}/images"
 XET_CACHE_DIR = f"{SCRATCH_DIR}/hf-xet"
 LLAMA_SRC_DIR = f"{SCRATCH_DIR}/llama.cpp"
 PREBUILT_DIR = f"{SCRATCH_DIR}/llama-prebuilt"
@@ -668,6 +674,8 @@ def ensure_model():
 
     repo_id, _, quant = MODEL_REPO.partition(":")
     patterns = [f"*{quant}*.gguf"] if quant else ["*.gguf"]
+    if MMPROJ_FILE:
+        patterns.append(MMPROJ_FILE)
 
     print(f"  Repo   : {repo_id}", flush=True)
     print(f"  Quant  : {quant or '(any)'}", flush=True)
@@ -706,10 +714,18 @@ def ensure_model():
     if not ggufs:
         raise RuntimeError(f"No .gguf files found in {MODEL_DIR}")
 
-    shard1 = [g for g in ggufs if "-00001-of-" in g]
-    entrypoint = shard1[0] if shard1 else ggufs[0]
-    print(f"  Model file: {entrypoint}", flush=True)
-    return entrypoint
+    mmproj_candidates = [g for g in ggufs if os.path.basename(g).lower().startswith("mmproj")]
+    model_candidates = [g for g in ggufs if not os.path.basename(g).lower().startswith("mmproj")]
+    if not model_candidates:
+        raise RuntimeError(f"No model .gguf files found in {MODEL_DIR}")
+
+    shard1 = [g for g in model_candidates if "-00001-of-" in g]
+    entrypoint = shard1[0] if shard1 else model_candidates[0]
+    mmproj_path = mmproj_candidates[0] if mmproj_candidates else None
+    print(f"  Model file : {entrypoint}", flush=True)
+    if mmproj_path:
+        print(f"  MMProj file: {mmproj_path}", flush=True)
+    return entrypoint, mmproj_path
 
 
 # ====================================================================
@@ -802,9 +818,92 @@ async def _pipe_stream(reader, writer, track_activity=True):
             pass
 
 
+async def _read_http_request(reader, first_chunk):
+    buf = first_chunk
+    while b"\r\n\r\n" not in buf:
+        more = await asyncio.wait_for(reader.read(65536), timeout=30.0)
+        if not more:
+            break
+        buf += more
+        if len(buf) > 128 * 1024:
+            break
+
+    sep = buf.find(b"\r\n\r\n")
+    if sep == -1:
+        return "", "", {}, b"", buf
+
+    header_bytes = buf[:sep]
+    rest = buf[sep + 4:]
+    header_text = header_bytes.decode("latin-1", errors="ignore")
+    lines = header_text.splitlines()
+    first_line = lines[0] if lines else ""
+    parts = first_line.split(" ")
+    method = parts[0].upper() if len(parts) >= 1 else ""
+    req_path = parts[1] if len(parts) >= 2 else ""
+
+    headers = {}
+    for line in lines[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+
+    content_length = int(headers.get("content-length", "0") or "0")
+    return method, req_path, headers, rest, header_bytes, first_line, content_length
+
+
+async def _read_exact_body(reader, rest, content_length, max_bytes):
+    if content_length > max_bytes:
+        return None, True
+    body = rest
+    while len(body) < content_length:
+        chunk = await asyncio.wait_for(reader.read(min(65536, content_length - len(body))), timeout=60.0)
+        if not chunk:
+            break
+        body += chunk
+    return body[:content_length], False
+
+
+def _is_authorized(headers, api_key):
+    val = headers.get("authorization", "")
+    return val == f"Bearer {api_key}" or val == api_key
+
+
+def _expand_image_refs_in_payload(payload):
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return None
+
+    missing = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        new_parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_ref":
+                img_id = str(part.get("id", "")).strip().lower()
+                img_path = os.path.join(IMAGE_STORE_DIR, f"{img_id}.jpg")
+                if not re.fullmatch(r"[a-f0-9]{64}", img_id) or not os.path.isfile(img_path):
+                    missing.append(img_id)
+                else:
+                    with open(img_path, "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode("ascii")
+                    new_parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                    })
+            else:
+                new_parts.append(part)
+        msg["content"] = new_parts
+
+    return missing if missing else None
+
+
 async def _handle_gateway_client(client_reader, client_writer, llama_port, api_key):
     try:
-        initial = await asyncio.wait_for(client_reader.read(8192), timeout=30.0)
+        initial = await asyncio.wait_for(client_reader.read(65536), timeout=30.0)
     except Exception:
         client_writer.close()
         return
@@ -815,27 +914,21 @@ async def _handle_gateway_client(client_reader, client_writer, llama_port, api_k
 
     _gateway_state["last_activity"] = time.time()
 
-    # Inspect HTTP request line & headers if present
-    header_End = initial.find(b"\r\n\r\n")
-    header_bytes = initial[:header_End] if header_End != -1 else initial[:1024]
-    header_text = header_bytes.decode("latin-1", errors="ignore")
-    lines = header_text.splitlines()
-    first_line = lines[0] if lines else ""
-    parts = first_line.split(" ")
-    method = parts[0].upper() if len(parts) >= 1 else ""
-    path = parts[1] if len(parts) >= 2 else ""
+    try:
+        method, req_path, headers, rest, header_bytes, first_line, content_length = await _read_http_request(
+            client_reader, initial
+        )
+    except Exception:
+        client_writer.close()
+        return
 
-    # Check admin control routes
-    if path.startswith("/__aichat_admin/"):
-        auth_ok = False
-        for line in lines[1:]:
-            if line.lower().startswith("authorization:"):
-                val = line.split(":", 1)[1].strip()
-                if val == f"Bearer {api_key}" or val == api_key:
-                    auth_ok = True
-                    break
+    clean_path = req_path.split("?", 1)[0]
 
-        if path.startswith("/__aichat_admin/heartbeat"):
+    # ── Admin control routes ──
+    if clean_path.startswith("/__aichat_admin/"):
+        auth_ok = _is_authorized(headers, api_key)
+
+        if clean_path.startswith("/__aichat_admin/heartbeat"):
             _gateway_state["last_activity"] = time.time()
             _send_http_json(
                 client_writer,
@@ -844,6 +937,7 @@ async def _handle_gateway_client(client_reader, client_writer, llama_port, api_k
                 {
                     "ok": True,
                     "run_id": RUN_ID,
+                    "marker": STARTUP_MARKER,
                     "uptime_seconds": int(time.time() - START_TIME),
                     "active_connections": _gateway_state["active_connections"],
                 },
@@ -852,7 +946,7 @@ async def _handle_gateway_client(client_reader, client_writer, llama_port, api_k
             client_writer.close()
             return
 
-        if path.startswith("/__aichat_admin/shutdown"):
+        if clean_path.startswith("/__aichat_admin/shutdown"):
             if not auth_ok:
                 _send_http_json(client_writer, 401, "Unauthorized", {"ok": False, "error": "Invalid API Key"})
                 await client_writer.drain()
@@ -871,17 +965,186 @@ async def _handle_gateway_client(client_reader, client_writer, llama_port, api_k
             _gateway_state["shutdown_requested"] = True
             return
 
+    # ── Image Sync: GET /session ──
+    if method == "GET" and clean_path == "/session":
+        if not _is_authorized(headers, api_key):
+            _send_http_json(client_writer, 401, "Unauthorized", {"error": "Invalid API Key"})
+            await client_writer.drain()
+            client_writer.close()
+            return
+        _send_http_json(
+            client_writer,
+            200,
+            "OK",
+            {
+                "marker": STARTUP_MARKER,
+                "capabilities": {"image_ref": True, "manifest": True},
+                "max_image_bytes": MAX_IMAGE_BYTES,
+            },
+        )
+        await client_writer.drain()
+        client_writer.close()
+        return
+
+    # ── Image Sync: POST /images/manifest ──
+    if method == "POST" and clean_path == "/images/manifest":
+        if not _is_authorized(headers, api_key):
+            _send_http_json(client_writer, 401, "Unauthorized", {"error": "Invalid API Key"})
+            await client_writer.drain()
+            client_writer.close()
+            return
+        body, too_big = await _read_exact_body(client_reader, rest, content_length, 2 * 1024 * 1024)
+        if too_big or body is None:
+            _send_http_json(client_writer, 413, "Payload Too Large", {"error": "Manifest too large"})
+            await client_writer.drain()
+            client_writer.close()
+            return
+        try:
+            data = json.loads(body.decode("utf-8"))
+            ids = data.get("ids", [])
+        except Exception:
+            _send_http_json(client_writer, 400, "Bad Request", {"error": "Invalid JSON"})
+            await client_writer.drain()
+            client_writer.close()
+            return
+        os.makedirs(IMAGE_STORE_DIR, exist_ok=True)
+        missing = []
+        for raw_id in ids:
+            img_id = str(raw_id).strip().lower()
+            if not re.fullmatch(r"[a-f0-9]{64}", img_id) or not os.path.isfile(os.path.join(IMAGE_STORE_DIR, f"{img_id}.jpg")):
+                missing.append(img_id)
+        _send_http_json(client_writer, 200, "OK", {"missing": missing})
+        await client_writer.drain()
+        client_writer.close()
+        return
+
+    # ── Image Sync: PUT/HEAD /images/{id} ──
+    if clean_path.startswith("/images/"):
+        if not _is_authorized(headers, api_key):
+            _send_http_json(client_writer, 401, "Unauthorized", {"error": "Invalid API Key"})
+            await client_writer.drain()
+            client_writer.close()
+            return
+        img_id = clean_path[len("/images/"):].strip().lower()
+        if not re.fullmatch(r"[a-f0-9]{64}", img_id):
+            _send_http_json(client_writer, 400, "Bad Request", {"error": "Invalid image ID"})
+            await client_writer.drain()
+            client_writer.close()
+            return
+
+        os.makedirs(IMAGE_STORE_DIR, exist_ok=True)
+        target_path = os.path.join(IMAGE_STORE_DIR, f"{img_id}.jpg")
+
+        if method == "HEAD":
+            exists = os.path.isfile(target_path)
+            status_line = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" if exists else "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            client_writer.write(status_line.encode("utf-8"))
+            await client_writer.drain()
+            client_writer.close()
+            return
+
+        if method == "PUT":
+            ctype = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            if ctype != "image/jpeg":
+                _send_http_json(client_writer, 415, "Unsupported Media Type", {"error": "Content-Type must be image/jpeg"})
+                await client_writer.drain()
+                client_writer.close()
+                return
+            body, too_big = await _read_exact_body(client_reader, rest, content_length, MAX_IMAGE_BYTES)
+            if too_big or body is None:
+                _send_http_json(client_writer, 413, "Payload Too Large", {"error": "Image exceeds max_image_bytes"})
+                await client_writer.drain()
+                client_writer.close()
+                return
+            actual_hash = hashlib.sha256(body).hexdigest()
+            if actual_hash != img_id:
+                _send_http_json(client_writer, 422, "Unprocessable Entity", {"error": "SHA-256 mismatch"})
+                await client_writer.drain()
+                client_writer.close()
+                return
+            existed = os.path.isfile(target_path)
+            tmp_path = f"{target_path}.{threading.get_ident()}.{int(time.time() * 1000)}.tmp"
+            try:
+                with open(tmp_path, "wb") as f:
+                    f.write(body)
+                os.replace(tmp_path, target_path)
+            except OSError as e:
+                _send_http_json(client_writer, 507, "Insufficient Storage", {"error": str(e)})
+                await client_writer.drain()
+                client_writer.close()
+                return
+            _send_http_json(
+                client_writer,
+                200 if existed else 201,
+                "OK" if existed else "Created",
+                {"ok": True, "id": img_id, "bytes": len(body)},
+            )
+            await client_writer.drain()
+            client_writer.close()
+            return
+
+    # ── Chat Completions: Marker Check + image_ref Expansion ──
+    forward_payload_bytes = None
+    if method == "POST" and clean_path == "/v1/chat/completions":
+        req_marker = headers.get("x-session-marker")
+        if req_marker and req_marker != STARTUP_MARKER:
+            _send_http_json(
+                client_writer,
+                409,
+                "Conflict",
+                {"error": "marker_mismatch", "marker": STARTUP_MARKER},
+            )
+            await client_writer.drain()
+            client_writer.close()
+            return
+
+        if content_length > 0:
+            body, too_big = await _read_exact_body(client_reader, rest, content_length, 32 * 1024 * 1024)
+            if too_big or body is None:
+                _send_http_json(client_writer, 413, "Payload Too Large", {"error": "Request body too large"})
+                await client_writer.drain()
+                client_writer.close()
+                return
+            try:
+                payload = json.loads(body.decode("utf-8"))
+                missing = _expand_image_refs_in_payload(payload)
+                if missing:
+                    _send_http_json(
+                        client_writer,
+                        424,
+                        "Failed Dependency",
+                        {"error": "missing_images", "missing": missing},
+                    )
+                    await client_writer.drain()
+                    client_writer.close()
+                    return
+                new_body = json.dumps(payload).encode("utf-8")
+                rebuilt_headers = [first_line]
+                for line in header_bytes.decode("latin-1", errors="ignore").splitlines()[1:]:
+                    if line.lower().startswith("content-length:") or line.lower().startswith("x-session-marker:"):
+                        continue
+                    rebuilt_headers.append(line)
+                rebuilt_headers.append(f"Content-Length: {len(new_body)}")
+                forward_payload_bytes = ("\r\n".join(rebuilt_headers) + "\r\n\r\n").encode("latin-1") + new_body
+            except Exception:
+                forward_payload_bytes = header_bytes + b"\r\n\r\n" + body
+
     # Standard OpenAI / llama-server proxy path
     _gateway_state["active_connections"] += 1
     llama_writer = None
     try:
         llama_reader, llama_writer = await asyncio.open_connection("127.0.0.1", llama_port)
-        llama_writer.write(initial)
-        await llama_writer.drain()
-        await asyncio.gather(
-            _pipe_stream(client_reader, llama_writer, track_activity=True),
-            _pipe_stream(llama_reader, client_writer, track_activity=True),
-        )
+        if forward_payload_bytes is not None:
+            llama_writer.write(forward_payload_bytes)
+            await llama_writer.drain()
+            await _pipe_stream(llama_reader, client_writer, track_activity=True)
+        else:
+            llama_writer.write(initial)
+            await llama_writer.drain()
+            await asyncio.gather(
+                _pipe_stream(client_reader, llama_writer, track_activity=True),
+                _pipe_stream(llama_reader, client_writer, track_activity=True),
+            )
     except Exception:
         try:
             client_writer.close()
@@ -1044,7 +1307,7 @@ try:
 
     # -- 2. MODEL DOWNLOAD ------------------------------------------------
     section(2, TOTAL_STEPS, "Model download (HF/Xet)")
-    model_path = ensure_model()
+    model_path, mmproj_path = ensure_model()
 
     # -- 3. START LLAMA-SERVER & GATEWAY ----------------------------------
     section(3, TOTAL_STEPS, "Start llama-server & Asyncio Gateway")
@@ -1058,9 +1321,11 @@ try:
         if not ENABLE_THINKING
         else "--reasoning on"
     )
+    mmproj_flag = f"--mmproj {mmproj_path} " if mmproj_path else ""
     llama_cmd = (
         f"{server_cmd} "
         f"-m {model_path} "
+        f"{mmproj_flag}"
         f"--host 127.0.0.1 --port {LLAMA_INTERNAL_PORT} "
         f"--api-key {API_KEY} "
         f"--ctx-size {NUM_CTX} "
